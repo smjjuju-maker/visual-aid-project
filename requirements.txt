@@ -1,0 +1,9 @@
+depthai
+adafruit-circuitpython-bno08x
+pyttsx3
+numpy
+scipy
+matplotlib
+pandas
+opencv-python
+jupyter
