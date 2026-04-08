@@ -1,17 +1,78 @@
 # visual-aid-project
 
-시각장애인 보행 보조 시스템
+BNO085 IMU step counting, OAK-D-Lite depth detection, fusion, and TTS project in Python.
 
-## 목표
-- BNO085: 걸음수 계싼
-- OAK-D-Lite: 장애물 인식
-- Fusion: "앞 의자가 3걸음 앞"
-- AfterShokz: 골전도 음성 안내
+## Project Goal
+This project aims to build a visual aid pipeline using:
+- BNO085 IMU for acceleration data
+- OAK-D-Lite for depth information
+- Step detection from IMU Z-axis
+- Fusion of step count and obstacle distance
+- Text-to-speech output
 
-## Day3 Progress (2026-04-08)
-- imureader.py 완성: `data/dummyimu.csv` → pandas DataFrame → `accel_z` 리스트 반환
-- oakreader.py 완성: 더미 depth 정보 반환 (`min_depth`, `object`, `confidence` dict)
-- ttsoutput.py 완성: `pyttsx3`로 메시지 음성 출력 (rate=150, volume=1.0)
-- Jupyter notebook: IMU Z축 데이터 sine wave 시각화 ✓
-- src/test_day3.py: IMU → Depth → TTS 전체 연결 테스트 성공
-- Git: Day3 커밋 완료 (`git log --oneline` 최상단에 Day3 커밋 확인)
+## Project Structure
+```text
+visual-aid-project/
+├─ README.md
+├─ requirements.txt
+├─ data/
+│  └─ dummyimu.csv
+├─ src/
+│  ├─ imureader.py
+│  ├─ oakreader.py
+│  ├─ ttsoutput.py
+│  ├─ stepdetector.py
+│  ├─ fusion.py
+│  └─ main.py
+└─ .vscode/
+   └─ settings.json
+```
+
+## Environment Setup
+1. Create and activate virtual environment
+2. Install packages from requirements.txt
+3. Select Python interpreter in VS Code
+
+## Install
+```powershell
+pip install -r requirements.txt
+```
+
+## Run Current Modules
+
+### IMU reader
+```powershell
+python src/imureader.py
+```
+
+### OAK reader
+```powershell
+python src/oakreader.py
+```
+
+### TTS output
+```powershell
+python src/ttsoutput.py
+```
+
+## Progress
+
+### Day1
+- VS Code, Git, venv, requirements.txt setup completed
+- Python environment and package import checked
+
+### Day2
+- Created `src` and `data` folders
+- Added `dummyimu.csv`
+- Created starter files for module structure
+
+### Day3
+- Completed `imureader.py`: CSV to DataFrame and accel_z extraction
+- Completed `oakreader.py`: dummy depth dictionary return
+- Completed `ttsoutput.py`: message speech output
+- Tested IMU plot and basic module connection
+
+## Next Steps
+- Day5: implement `stepdetector.py`
+- Day6: implement `fusion.py`
+- Day7: integrate in `main.py`
