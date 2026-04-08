@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-def detect_steps(accel_z_list, threshold=0.3):
+def detect_steps(accel_z_list, threshold=0.2):
     """
     IMU Z축 데이터에서 스텝 감지 (peak detection)
     """
@@ -22,7 +22,7 @@ if __name__ == "__main__":
     # 더 강한 스텝 데이터
     test_z = [9.8, 10.5, 9.7, 10.6, 9.6, 10.7, 9.8, 10.8, 9.9, 10.4, 9.7]
     print("테스트 데이터:", test_z)
-    steps, peaks = detect_steps(test_z, threshold=0.5)
+    steps, peaks = detect_steps(test_z)
     print(f"감지된 스텝 수: {steps}")
     print(f"피크 위치: {peaks}")
     print(f"평균: {np.mean(test_z):.2f}")
