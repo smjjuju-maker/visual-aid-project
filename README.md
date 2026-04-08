@@ -71,6 +71,7 @@ python src/ttsoutput.py
 - Completed `oakreader.py`: dummy depth dictionary return
 - Completed `ttsoutput.py`: message speech output
 - Tested IMU plot and basic module connection
+- test_week1.py: 통합 테스트 PASS
 
 ## Next Steps
 - Day5: implement `stepdetector.py`
