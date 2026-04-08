@@ -10,4 +10,4 @@ def get_depth_info():
 
 if __name__ == "__main__":
     depth_info = get_depth_info()
-    print("Depth 정보:", depth_info)
+    print("Depth 정보:", depth_info)    
