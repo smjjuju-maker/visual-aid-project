@@ -312,6 +312,20 @@ def build_tactile_leaving_guidance():
     return ["tactile_leaving"], "점자블록 곧 벗어남."
 
 
+def build_tactile_query_guidance(tactile, stride_m):
+    """버튼을 눌렀을 때 점자블록 상태 안내. → (chunks, text)
+       tactile: detect_tactile_paving() 결과(dict) 또는 None.
+       있으면 방향·거리까지, 없으면 "주변에 점자블록이 없습니다."
+    """
+    if tactile is None or not tactile.get("present"):
+        return ["tactile_none"], "주변에 점자블록이 없습니다."
+    return build_tactile_appear_guidance(
+        tactile.get("clock_direction"),
+        tactile.get("distance_m"),
+        stride_m,
+    )
+
+
 def build_tactile_disappear_guidance():
     """점자블록이 사라졌을 때 안내. (현재 미사용) → (chunks, text)"""
     return ["tactile_leaving"], "점자블록 벗어남."

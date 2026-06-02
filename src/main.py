@@ -34,8 +34,7 @@ from step_converter import (
     get_front_half_width,
     build_guidance,
     build_narrow_corridor_guidance,
-    build_tactile_appear_guidance,
-    build_tactile_leaving_guidance,
+    build_tactile_query_guidance,
     distance_to_steps,
     assess_safety,
 )
@@ -136,6 +135,26 @@ def main():
     # 2) 음성 엔진
     speaker = Speaker(dry_run=dry_run)
 
+    # 2-1) 점자블록 조회 버튼 (GPIO17). 누르면 현재 점자블록 상태를 안내.
+    #      노트북(--dry-run, gpiozero 없음)에서도 돌아가도록 ImportError를 흡수한다.
+    button = None
+    button_state = {"latest": None}   # 루프가 최신 점자블록 측정값을 넣어줌
+    try:
+        from gpiozero import Button
+        button = Button(17, pull_up=True, bounce_time=0.05)
+
+        def on_button_press():
+            guidance = build_tactile_query_guidance(
+                button_state["latest"], stride_m)
+            speaker.say_now(guidance)   # 버튼 응답은 즉시(인터럽트)
+
+        button.when_pressed = on_button_press
+        print("[버튼] 점자블록 조회 버튼 준비 완료 (GPIO17)")
+    except ImportError:
+        print("[버튼] gpiozero 없음 → 버튼 비활성화 (노트북 테스트 모드)")
+    except Exception as e:
+        print(f"[버튼] 초기화 실패 → 버튼 비활성화: {e}")
+
     # 3) OAK 연결
     print("\n[연결] OAK-D-Lite 시작 중...")
     try:
@@ -153,11 +172,8 @@ def main():
             last_obstacle_speak_time = 0.0
 
             # ── 점자블록 상태 ──
-            tactile_present = False
-            tactile_raw_streak_present = 0
-            tactile_raw_streak_absent = 0
-            tactile_leaving_announced = False   # 현재 점자블록 구간에서 '곧 벗어남' 했나
-            tactile_leaving_streak = 0          # 연속으로 '먼 끝 가까움' 잡힌 프레임 수
+            # 자동 안내는 하지 않는다. 버튼을 누를 때만 안내하므로,
+            # 버튼 핸들러(다른 스레드)가 읽을 최신 측정값은 button_state에 보관한다.
 
             # ── 좁은 통로 상태 ──
             in_narrow = False
@@ -176,6 +192,9 @@ def main():
                     situation, clearance = reader.get_open_direction(
                         narrow_side_m=narrow_threshold)
 
+                    # 버튼 핸들러(다른 스레드)가 읽을 최신 점자블록 상태 보관
+                    button_state["latest"] = tactile
+
                     if debug:
                         if obstacles:
                             info = [(o["label"], f"{o['distance_m']:.2f}m")
@@ -188,47 +207,8 @@ def main():
                                   f"C{clearance['center_m']:.2f}/"
                                   f"R{clearance['right_m']:.2f} → {situation}")
 
-                    # ─────────────────────────────────────────────────
-                    # 점자블록 상태 확정 + 이벤트 판정
-                    # ─────────────────────────────────────────────────
-                    tactile_event = None   # "appear" | "leaving" | None
-                    if tactile is not None:
-                        if tactile["present"]:
-                            tactile_raw_streak_present += 1
-                            tactile_raw_streak_absent = 0
-                        else:
-                            tactile_raw_streak_absent += 1
-                            tactile_raw_streak_present = 0
-
-                        # 새로 나타남 확정
-                        if (not tactile_present
-                                and tactile_raw_streak_present >= TACTILE_CONFIRM_FRAMES):
-                            tactile_present = True
-                            tactile_leaving_announced = False
-                            tactile_leaving_streak = 0
-                            tactile_event = "appear"
-                        # 완전 사라짐 확정 → 사후 안내는 안 함. 상태만 리셋.
-                        elif (tactile_present
-                              and tactile_raw_streak_absent >= TACTILE_CONFIRM_FRAMES):
-                            tactile_present = False
-                            tactile_leaving_announced = False
-                            tactile_leaving_streak = 0
-
-                        # 점자블록 위인 동안 '먼 끝이 곧'인지 확인
-                        if (tactile_present
-                                and tactile["present"]
-                                and not tactile_leaving_announced):
-                            far_m = tactile.get("far_end_distance_m")
-                            if far_m is not None and far_m > 0:
-                                far_steps = distance_to_steps(far_m, stride_m)
-                                if far_steps <= TACTILE_LEAVING_STEPS:
-                                    tactile_leaving_streak += 1
-                                else:
-                                    tactile_leaving_streak = 0
-
-                                if tactile_leaving_streak >= TACTILE_CONFIRM_FRAMES:
-                                    tactile_event = "leaving"
-                                    tactile_leaving_announced = True
+                    # 점자블록은 자동 안내하지 않는다. 버튼을 누를 때만 안내한다.
+                    # (버튼 핸들러가 button_state["latest"]를 읽어 build_tactile_query_guidance 호출)
 
                     # ─────────────────────────────────────────────────
                     # 좁은 통로 상태 확정 + 이벤트 판정
@@ -312,18 +292,9 @@ def main():
                                         obstacle_announced_this_frame = True
 
                     # ─────────────────────────────────────────────────
-                    # (2) 점자블록 안내 (장애물과 공존 가능. is_speaking으로 양보)
+                    # (2) 점자블록 안내 — 자동 안내 없음. 버튼(GPIO17)을 누르면
+                    #     on_button_press()가 button_state["latest"]를 읽어 안내한다.
                     # ─────────────────────────────────────────────────
-                    if tactile_event is not None and not speaker.is_speaking():
-                        if tactile_event == "appear":
-                            t_guidance = build_tactile_appear_guidance(
-                                tactile["clock_direction"],
-                                tactile["distance_m"],
-                                stride_m,
-                            )
-                        else:  # "leaving"
-                            t_guidance = build_tactile_leaving_guidance()
-                        speaker.say(t_guidance)
 
                     # ─────────────────────────────────────────────────
                     # (3) 좁은 통로 진입 안내
