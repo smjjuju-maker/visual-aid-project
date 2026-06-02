@@ -37,16 +37,14 @@ LABELS = [
 ]
 
 # 실내 보행에 의미 있는 클래스만 (영문 → 한글)
+#   ※ 화분/고양이/강아지/병은 제외(사용자 요청). 미확인 물체는 depth 기반으로
+#     "장애물"이라고 안내하므로, 여기 없는 물체도 충돌 경고는 정상 작동한다.
 INDOOR_RELEVANT = {
     "person":      "사람",
     "chair":       "의자",
     "sofa":        "소파",
     "diningtable": "식탁",
     "tvmonitor":   "모니터",
-    "pottedplant": "화분",
-    "cat":         "고양이",
-    "dog":         "강아지",
-    "bottle":      "병",
 }
 
 # ── 설정값 ────────────────────────────────────────────
@@ -103,7 +101,7 @@ def create_pipeline():
     stereo.initialConfig.setConfidenceThreshold(200)
     stereo.initialConfig.setMedianFilter(dai.MedianFilter.MEDIAN_OFF)
     stereo.setLeftRightCheck(True)
-    stereo.setSubpixel(False)
+    stereo.setSubpixel(True)    # 먼 거리 disparity를 소수 단위로 추정 → 4~5m 양자화(계단현상) 완화
     stereo.setExtendedDisparity(False)
     stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)
 
@@ -180,6 +178,13 @@ class OakReader:
         self._latest_depth = None
         self._latest_rgb = None
         self._distance_history = defaultdict(lambda: deque(maxlen=SMOOTHING_WINDOW))
+        # 좌/중/우 거리 이동평균용 + 방향(situation) 다수결용 버퍼
+        self._clear_hist = {
+            "left":   deque(maxlen=SMOOTHING_WINDOW),
+            "center": deque(maxlen=SMOOTHING_WINDOW),
+            "right":  deque(maxlen=SMOOTHING_WINDOW),
+        }
+        self._situation_hist = deque(maxlen=SMOOTHING_WINDOW)
 
     def __enter__(self):
         self.device = dai.Device(self.pipeline, maxUsbSpeed=dai.UsbSpeed.HIGH)
@@ -256,9 +261,20 @@ class OakReader:
 
     def get_open_direction(self, narrow_side_m=NARROW_SIDE_DEFAULT_M):
         """depth 맵을 좌/중/우로 3등분해 회피 + 좁은 통로 판단.
+
         반환: (situation, info)
-          situation: "right"/"left"/"either"/"blocked"/"narrow"
+          situation: "right"/"left"/"either"/"narrow"/"blocked"
+            - right/left/either: 좌우로 회피 가능
+            - narrow: 좌우는 가깝지만(벽/책상) 정면은 트임 → 좁은 통로, 직진 주의
+                      (※ 좌우 둘 다 막혀도 정면이 열려 있으면 막다른 길이 아니라
+                          좁은 통로로 본다 — 직진 경로는 살아있으므로)
+            - blocked: 좌·중·우 모두 막힘 = 진짜 막다른 길
           info: {"left_m":.., "center_m":.., "right_m":..}
+
+        [안정화 3종]
+          ① region_clearance: 0.3m 미만 근접노이즈·측정실패·10m 초과 제외
+          ② 좌/중/우 거리를 SMOOTHING_WINDOW 프레임 이동평균
+          ③ 최종 situation을 최근 프레임 다수결로 확정 (단일 프레임 깜빡임 제거)
         """
         self._update_depth()
         if self._latest_depth is None:
@@ -275,44 +291,69 @@ class OakReader:
         right = band[:, 2 * third:]
 
         def region_clearance(region):
-            valid = region[region > 0]
-            if valid.size == 0:
+            # 0.3m 미만(근접 노이즈)·0(측정 실패)·10m 초과 제외
+            valid = region[(region > 300) & (region < 10000)]
+            if valid.size < region.size * 0.05:   # 유효 픽셀 5% 미만 → 신뢰 불가
                 return 0.0
-            return float(np.percentile(valid, 10)) / 1000.0
+            return float(np.percentile(valid, 20)) / 1000.0   # 10→20%로 노이즈 완화
 
-        left_m = region_clearance(left)
-        center_m = region_clearance(center)
-        right_m = region_clearance(right)
+        # ① 이번 프레임 raw 값
+        raw_l = region_clearance(left)
+        raw_c = region_clearance(center)
+        raw_r = region_clearance(right)
+
+        # ② 프레임 간 이동평균 (0=측정실패는 평균에서 제외해 급격한 0 방지)
+        for key, val in (("left", raw_l), ("center", raw_c), ("right", raw_r)):
+            if val > 0:
+                self._clear_hist[key].append(val)
+
+        def _avg(key):
+            hh = self._clear_hist[key]
+            return sum(hh) / len(hh) if hh else 0.0
+
+        left_m, center_m, right_m = _avg("left"), _avg("center"), _avg("right")
         info = {"left_m": left_m, "center_m": center_m, "right_m": right_m}
 
+        # 세 구역 모두 측정 실패(0) → 워밍업·전면 무효 프레임.
+        # blocked로 단정하지 말고 직전 확정값 유지(버퍼 비었으면 either).
+        if raw_l == 0 and raw_c == 0 and raw_r == 0:
+            if self._situation_hist:
+                situation = max(set(self._situation_hist),
+                                key=self._situation_hist.count)
+            else:
+                situation = "either"
+            return situation, info
+
+        left_open = left_m >= CLEAR_THRESHOLD_M
+        right_open = right_m >= CLEAR_THRESHOLD_M
         center_open = center_m >= CLEAR_THRESHOLD_M
 
         # ── 좁은 통로 판정 (blocked보다 우선) ──
-        #   실측 데이터 기준: 책상 사이 통로 = 양옆 0.85~1.2m, 정면 1.65~1.78m.
-        #   조건: 양옆이 둘 다 narrow_side_m 이내(벽/책상이 가까움)
-        #         + 정면이 양옆보다 확실히 멀다(앞은 트임).
-        #   "정면이 양옆 최댓값보다 NARROW_FRONT_MARGIN_M 이상 멀다"로 본다.
+        #   (A) 실측 기준: 양옆이 둘 다 narrow_side_m 이내(벽/책상) +
+        #       정면이 양옆 최댓값보다 NARROW_FRONT_MARGIN_M 이상 멀다(앞은 트임).
+        #   (B) 좌우가 둘 다 안 열려 있어도(<CLEAR_THRESHOLD_M) 정면이 열려 있으면
+        #       막다른 길이 아니라 좁은 통로로 본다. (직진 경로가 살아있음)
         side_max = max(left_m, right_m)
         front_clear_vs_side = (center_m - side_max) >= NARROW_FRONT_MARGIN_M
         both_sides_close = (left_m < narrow_side_m and right_m < narrow_side_m
                             and left_m > 0 and right_m > 0)
-        if both_sides_close and front_clear_vs_side:
-            return "narrow", info
+        narrow_by_margin = both_sides_close and front_clear_vs_side
+        narrow_by_center = (not left_open and not right_open and center_open)
 
-        left_open = left_m >= CLEAR_THRESHOLD_M
-        right_open = right_m >= CLEAR_THRESHOLD_M
         diff = abs(right_m - left_m)
-
-        if not left_open and not right_open:
-            situation = "blocked"
+        if narrow_by_margin or narrow_by_center:
+            cur = "narrow"
         elif left_open and right_open:
-            if diff < SIDE_DIFF_THRESHOLD_M:
-                situation = "either"
-            else:
-                situation = "right" if right_m > left_m else "left"
+            cur = "either" if diff < SIDE_DIFF_THRESHOLD_M else \
+                  ("right" if right_m > left_m else "left")
+        elif left_open or right_open:
+            cur = "right" if right_open else "left"
         else:
-            situation = "right" if right_open else "left"
+            cur = "blocked"   # 좌·중·우 모두 막힘 = 진짜 막다른 길
 
+        # ③ 최근 프레임 다수결로 최종 확정 (한 프레임 튀어도 안 흔들림)
+        self._situation_hist.append(cur)
+        situation = max(set(self._situation_hist), key=self._situation_hist.count)
         return situation, info
 
     def _depth_at(self, rgb_x, rgb_y, rgb_h, rgb_w, patch_radius=5):

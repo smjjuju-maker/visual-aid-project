@@ -35,6 +35,7 @@ from step_converter import (
     build_guidance,
     build_narrow_corridor_guidance,
     build_tactile_appear_guidance,
+    build_tactile_leaving_guidance,
     distance_to_steps,
     assess_safety,
 )
@@ -51,21 +52,59 @@ TACTILE_LEAVING_STEPS = 4
 TACTILE_CONFIRM_FRAMES = 3
 NARROW_CONFIRM_FRAMES = 3
 
+# depth로 미확인 장애물을 안내할 때, 근처 검출 물체의 라벨을 빌려오는 기준
+NEAR_NOISE_M = 0.4            # 이보다 가까운 검출 거리는 측정 신뢰도 낮음 → 라벨 후보 제외
+LABEL_BORROW_MARGIN_M = 0.6  # 정면 depth 거리보다 이만큼 이내로 가까운 검출이면 같은 물체로 보고 라벨 차용
 
-def pick_priority_obstacle(obstacles):
-    """안내할 장애물 1개 선택.
 
-    [선택지 A] 정면(사용자 진행 경로) 장애물만 안내한다.
-    양옆 장애물은 진행 경로를 막지 않으므로 무시한다.
-    정면에 여러 개면 가장 가까운 것.
-    정면에 아무것도 없으면 None (조용).
+def pick_priority_obstacle(obstacles, center_m=None):
+    """안내할 정면 장애물 1개 선택. (depth 우선 + 검출로 라벨·거리 보강)
+
+    [정책]
+      1) MobileNet이 정면에서 잡은 물체가 있으면 그중 가장 가까운 것.
+         → 거리도 라벨(예: "의자")도 그 물체 기준.
+      2) 정면 검출은 없지만 depth상 정면(center_m)이 가까우면 경고한다.
+         이때 좌우 포함 전체 검출 중 거리가 center_m과 비슷하거나 더 가까운 게
+         있으면 그 라벨을 빌려오고(예: "의자"), 거리는 검출과 depth 중
+         '더 가까운' 값을 쓴다. → 종류도 살리고, 더 급한 거리로 안내.
+         비슷한 검출이 없으면 "장애물"(미확인) + center_m 으로 안내한다.
+         (모델이 모르는 기둥·박스·벽 모서리 등도 놓치지 않음)
+      3) 정면에 검출도 없고 depth도 충분히 멀면 None(조용).
+
+    center_m: 정면 depth 거리(m). None이거나 0이면 depth 판단 생략.
     """
-    if not obstacles:
-        return None
+    obstacles = obstacles or []
     front = [o for o in obstacles if o["direction"] == "정면"]
-    if not front:
-        return None
-    return min(front, key=lambda o: o["distance_m"])
+
+    # 1) 정면 검출 물체 우선
+    if front:
+        return min(front, key=lambda o: o["distance_m"])
+
+    # 2) 정면 검출 없음 + depth 정면이 가까움 → 경고 (라벨/거리 보강)
+    if center_m is not None and center_m > 0:
+        if assess_safety(center_m) in ("stop", "warn"):
+            label = "장애물"
+            dist = center_m
+            # 좌우 포함 검출 중, 너무 가깝지(노이즈) 않으면서
+            # center_m 근처이거나 더 가까운 것 → 같은 물체로 보고 라벨 차용
+            candidates = [
+                o for o in obstacles
+                if o["distance_m"] >= NEAR_NOISE_M
+                and o["distance_m"] <= center_m + LABEL_BORROW_MARGIN_M
+            ]
+            if candidates:
+                closest = min(candidates, key=lambda o: o["distance_m"])
+                label = closest["label"]
+                dist = min(center_m, closest["distance_m"])   # 더 가까운 값(안전 우선)
+            return {
+                "label": label,
+                "distance_m": dist,
+                "direction": "정면",
+                "x_mm": 0,
+                "confidence": None,
+                "unknown": (label == "장애물"),
+            }
+    return None
 
 
 def make_obstacle_state_key(target, stride_m, avoid_situation):
@@ -105,7 +144,7 @@ def main():
             if usb is not None:
                 print(f"[연결] USB 속도: {usb}")
             print("[시작] 안내를 시작합니다. (Ctrl+C로 종료)\n")
-            speaker.say("안내를 시작합니다.")
+            speaker.say("sys_start")
 
             # ── 장애물 안내 상태 ──
             # 같은 상태 키가 유지되는 동안 stop은 N회까지, warn은 1회만 발화.
@@ -212,9 +251,11 @@ def main():
                         in_narrow = False
 
                     # ─────────────────────────────────────────────────
-                    # (1) 장애물 안내 — 상태 키 기반
+                    # (1) 장애물 안내 — depth 우선 + 검출 라벨 보강
+                    #     검출 물체가 없어도 정면 depth가 가까우면 "장애물"로 안내
                     # ─────────────────────────────────────────────────
-                    target = pick_priority_obstacle(obstacles)
+                    center_m = clearance["center_m"] if clearance else None
+                    target = pick_priority_obstacle(obstacles, center_m=center_m)
                     obstacle_announced_this_frame = False
 
                     # 회피 상황 (정면 장애물에만 의미)
@@ -253,14 +294,19 @@ def main():
                                             < STOP_REPEAT_INTERVAL):
                                     can_speak = False
 
-                                if can_speak and not speaker.is_speaking():
-                                    text = build_guidance(target, stride_m,
-                                                          avoid_situation=avoid_sit)
-                                    if text is not None:
+                                # stop은 진행 중 안내를 끊고 끼어들 수 있어야 하므로
+                                # is_speaking 가드를 적용하지 않는다(인터럽트).
+                                # warn 등 일반 안내만 재생 중이면 양보.
+                                gate_ok = (safety == "stop") or (not speaker.is_speaking())
+                                if can_speak and gate_ok:
+                                    guidance = build_guidance(target, stride_m,
+                                                              avoid_situation=avoid_sit)
+                                    chunks, text = guidance
+                                    if chunks is not None:
                                         if safety == "stop":
-                                            speaker.say_now(text)
+                                            speaker.say_now(guidance)   # 인터럽트
                                         else:
-                                            speaker.say(text)
+                                            speaker.say(guidance)
                                         obstacle_speak_count += 1
                                         last_obstacle_speak_time = now
                                         obstacle_announced_this_frame = True
@@ -270,14 +316,14 @@ def main():
                     # ─────────────────────────────────────────────────
                     if tactile_event is not None and not speaker.is_speaking():
                         if tactile_event == "appear":
-                            t_text = build_tactile_appear_guidance(
+                            t_guidance = build_tactile_appear_guidance(
                                 tactile["clock_direction"],
                                 tactile["distance_m"],
                                 stride_m,
                             )
                         else:  # "leaving"
-                            t_text = "점자블록 곧 벗어남."
-                        speaker.say(t_text)
+                            t_guidance = build_tactile_leaving_guidance()
+                        speaker.say(t_guidance)
 
                     # ─────────────────────────────────────────────────
                     # (3) 좁은 통로 진입 안내
@@ -290,7 +336,7 @@ def main():
 
             except KeyboardInterrupt:
                 print("\n[종료] 사용자 종료")
-                speaker.say_now("안내를 종료합니다.")
+                speaker.say_now("sys_end")
 
     except FileNotFoundError as e:
         print(f"\n[오류] {e}")

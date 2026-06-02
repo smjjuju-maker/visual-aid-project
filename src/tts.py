@@ -1,112 +1,150 @@
 """
 tts.py
 ------
-음성 출력 모듈 (pyttsx3 기반, 오프라인).
+음성 출력 모듈 (gTTS로 미리 만든 mp3 조각을 mpg123으로 재생, 오프라인).
+
+[동작]
+  - gen_voices.py 로 만들어 둔 voices/*.mp3 조각을 순서대로 재생한다.
+  - 안내는 "조각 키 리스트"로 들어온다. 예:
+      ["grade_warn","pos_front","step_2","ape","obj_chair","avoid_right"]
+    → 주의. 정면. 두 걸음. 앞에. 의자. 오른쪽으로 이동.
+  - 재생은 백그라운드 스레드에서 하여 메인 루프(카메라)를 막지 않는다.
+
+[인터럽트 — 핵심]
+  - say_now()(긴급/정지용)는 현재 재생 중인 조각 시퀀스를 즉시 중단하고
+    새 시퀀스를 처음부터 재생한다.
+  - 구현: 재생 중인 mpg123 프로세스를 kill + 진행 중 스레드에 취소 신호.
+    "안내 재생 중 빨리 걸어 충돌 임박" 상황에서 stop이 바로 끼어든다.
 
 [환경]
-  - 라즈베리파이에서 동작, 블루투스 골전도 이어폰으로 출력.
-  - 블루투스 페어링은 OS(라즈베리파이) 레벨에서 미리 연결해두면,
-    pyttsx3는 시스템 기본 출력 장치로 소리를 내보낸다.
-
-[설치]
-  pip install pyttsx3
-  # 라즈베리파이(리눅스)는 espeak 음성엔진 필요:
-  #   sudo apt-get install espeak
-  # 한국어 발음을 위해 voice를 'korean'으로 시도 (아래 _pick_korean_voice).
-
-[중복 안내 방지]
-  - 같은 문구를 매 프레임 반복하면 시끄럽다.
-  - 직전과 동일한 문구이고 짧은 시간 내면 다시 말하지 않는다.
+  - 라즈베리파이 + 블루투스 골전도 이어폰(OS 기본 출력 장치).
+  - 재생기: mpg123 (mp3). 라파에 설치 필요: sudo apt-get install -y mpg123
+  - dry_run=True 면 소리 없이 화면 출력만(PC 테스트).
 """
 
+import os
 import time
 import threading
+import subprocess
 
-try:
-    import pyttsx3
-    _HAS_PYTTSX3 = True
-except ImportError:
-    _HAS_PYTTSX3 = False
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+VOICES_DIR = os.path.join(SCRIPT_DIR, "voices")
+
+# 조각 키 → 화면표시용 한글(폴백). dry-run에서 chunks만 있고 text가 없을 때 사용.
+_CHUNK_KO = {
+    "grade_stop": "정지.", "grade_warn": "주의.", "pos_front": "정면",
+    "ape": "앞에", "narrow": "좁은 통로, 주의하세요.",
+    "obj_person": "사람.", "obj_chair": "의자.", "obj_sofa": "소파.",
+    "obj_table": "식탁.", "obj_monitor": "모니터.", "obj_unknown": "장애물.",
+    "avoid_right": "오른쪽으로 이동.", "avoid_left": "왼쪽으로 이동.",
+    "avoid_both": "양옆으로 피할 수 있음.",
+    "tactile": "점자블록.", "tactile_leaving": "점자블록 곧 벗어남.",
+    "sys_start": "안내를 시작합니다.", "sys_end": "안내를 종료합니다.",
+}
+
+
+def _normalize(item):
+    """안내 입력을 (chunks, text)로 정규화.
+       - (chunks, text) 튜플이면 그대로
+       - 조각 키 리스트면 text는 한글 조합으로 생성
+       - 단일 문자열(조각 키 or 일반 텍스트)도 허용
+    """
+    if item is None:
+        return None, None
+    if isinstance(item, tuple) and len(item) == 2:
+        return item
+    if isinstance(item, list):
+        text = " ".join(_CHUNK_KO.get(k, k) for k in item)
+        return item, text
+    if isinstance(item, str):
+        # 조각 키면 그 키 하나, 아니면 일반 텍스트(조각 없음)
+        if item in _CHUNK_KO:
+            return [item], _CHUNK_KO[item]
+        return [], item
+    return None, None
 
 
 class Speaker:
-    """음성 안내 담당. 중복 문구는 일정 시간 억제한다."""
+    """미리 만든 wav 조각을 aplay로 순차 재생. say_now는 인터럽트."""
 
-    def __init__(self, rate=170, repeat_cooldown=2.0, dry_run=False):
-        """
-        rate: 말하는 속도 (기본 170, 시각장애인용은 조금 빠르게도 가능)
-        repeat_cooldown: 같은 문구를 다시 말하기까지 최소 대기(초)
-        dry_run: True면 실제 음성 없이 화면 출력만 (PC 테스트용)
-        """
-        self.repeat_cooldown = repeat_cooldown
-        self.dry_run = dry_run or not _HAS_PYTTSX3
-        self.rate = rate
-        self._last_text = None
-        self._last_time = 0.0
-        self._speaking = False          # 현재 음성 재생 중인지
+    def __init__(self, dry_run=False):
+        self.dry_run = dry_run
         self._lock = threading.Lock()
-
-        if self.dry_run and not _HAS_PYTTSX3:
-            print("[TTS] pyttsx3 미설치 → 화면 출력 모드로 동작")
-
-    def _pick_korean_voice(self, engine):
-        """가능하면 한국어 음성을 선택."""
-        try:
-            for voice in engine.getProperty("voices"):
-                vid = (voice.id or "").lower()
-                vname = (getattr(voice, "name", "") or "").lower()
-                if "korea" in vid or "ko" in vid or "korean" in vname:
-                    engine.setProperty("voice", voice.id)
-                    return
-        except Exception:
-            pass  # 한국어 음성 없으면 기본 음성 사용
-
-    def _speak_blocking(self, text):
-        """엔진을 새로 만들어 한 문장 재생하고 닫는다.
-        (윈도우 pyttsx3의 runAndWait 반복 블로킹 문제 회피)"""
-        try:
-            engine = pyttsx3.init()
-            engine.setProperty("rate", self.rate)
-            self._pick_korean_voice(engine)
-            engine.say(text)
-            engine.runAndWait()
-            engine.stop()
-            del engine
-        except Exception as e:
-            print(f"[TTS 오류] {e}")
-        finally:
-            self._speaking = False
+        self._proc = None             # 현재 재생 중인 mpg123 프로세스
+        self._gen = 0                 # 재생 세대(인터럽트로 무효화 판단)
+        self._speaking = False
+        if not dry_run and not os.path.isdir(VOICES_DIR):
+            print(f"[TTS] voices 폴더 없음: {VOICES_DIR}")
+            print("      gen_voices.py 를 먼저 실행해 wav를 만들어 주세요.")
 
     def is_speaking(self):
-        """현재 음성 재생 중인지 여부."""
         return self._speaking
 
-    def say(self, text, force=False):
-        """문구를 음성으로 출력. 백그라운드 스레드에서 재생하여
-        메인 루프(카메라)를 막지 않음. (반복/타이밍 제어는 main에서 담당)"""
-        if not text:
-            return
+    def _wav(self, key):
+        return os.path.join(VOICES_DIR, f"{key}.mp3")
 
-        now = time.time()
+    def _play_sequence(self, chunks, my_gen):
+        """조각들을 순서대로 aplay. 세대(my_gen)가 바뀌면 즉시 중단."""
+        self._speaking = True
+        try:
+            for key in chunks:
+                if my_gen != self._gen:
+                    return                      # 인터럽트됨
+                path = self._wav(key)
+                if not os.path.exists(path):
+                    continue                    # 없는 조각은 건너뜀
+                try:
+                    proc = subprocess.Popen(
+                        ["mpg123", "-q", path],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except FileNotFoundError:
+                    print("[TTS 오류] mpg123 없음 (sudo apt-get install -y mpg123)")
+                    return
+                with self._lock:
+                    self._proc = proc
+                proc.wait()
+                with self._lock:
+                    self._proc = None
+        finally:
+            if my_gen == self._gen:
+                self._speaking = False
 
-        if self.dry_run:
-            self._last_text = text
-            self._last_time = now
-            print(f"[음성] {text}")
-            return
-
-        # 이미 말하는 중이면 새 안내는 건너뜀 (말 겹침 방지)
+    def _start(self, chunks, interrupt):
+        """재생 시작. interrupt=True면 진행 중인 재생을 끊고 새로 시작."""
         with self._lock:
-            if self._speaking:
-                return
-            self._speaking = True
-
-        self._last_text = text
-        self._last_time = now
-
-        t = threading.Thread(target=self._speak_blocking, args=(text,), daemon=True)
+            if interrupt:
+                self._gen += 1                  # 기존 시퀀스 무효화
+                if self._proc is not None:
+                    try:
+                        self._proc.kill()       # 재생 중 mpg123 즉시 종료
+                    except Exception:
+                        pass
+                    self._proc = None
+            elif self._speaking:
+                return                          # 일반 안내는 재생 중이면 양보
+            my_gen = self._gen
+        t = threading.Thread(target=self._play_sequence,
+                             args=(chunks, my_gen), daemon=True)
         t.start()
 
-    def say_now(self, text):
-        """긴급 경고용. (현재 구조상 say와 동일하게 동작하되 의미 구분)"""
-        self.say(text, force=True)
+    def say(self, item):
+        """일반 안내. 재생 중이면 양보(겹치지 않음)."""
+        chunks, text = _normalize(item)
+        if not chunks and not text:
+            return
+        if self.dry_run:
+            print(f"[음성] {text}")
+            return
+        self._start(chunks, interrupt=False)
+
+    def say_now(self, item):
+        """긴급/정지 안내. 진행 중 재생을 끊고 즉시 재생(인터럽트)."""
+        chunks, text = _normalize(item)
+        if not chunks and not text:
+            return
+        if self.dry_run:
+            print(f"[음성!] {text}")
+            return
+        self._start(chunks, interrupt=True)

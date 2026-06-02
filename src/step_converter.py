@@ -24,12 +24,31 @@ import json
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STRIDE_FILE = os.path.join(SCRIPT_DIR, "stride_config.json")
 
-# ── 안전 임계값 (걸음 수 기준) ─────────────────────────
-#   사용자(시각장애인)는 거리를 '걸음'으로 체감하므로 안전 등급도 걸음 수로 판단.
-#   걸음 수 = 매 프레임 실측 거리 ÷ 사용자 보폭 (누적 아님 → 오차 누적 없음)
-STOP_STEPS = 3       # 이 걸음 수 이내면 "정지" (비상)
-WARN_STEPS = 7       # 이 걸음 수 이내면 "주의"  ← 6에서 7로 변경
-                     # WARN_STEPS 초과는 "안전" → 안내 안 함
+# ── 안전 임계값 (실측 거리 m 기준) ───────────────────
+#   [설계 변경 근거]
+#   기존엔 "걸음 수"로 안전을 판단했으나, 걸음 수는 보폭에 따라 같은 위험거리가
+#   사람마다 다른 거리로 환산되는 문제가 있다(보폭 짧은 사람일수록 더 일찍 경고).
+#   안전은 보폭과 무관한 물리량이므로 "실측 거리(m)"로 판단하는 것이 옳다.
+#   (이 모듈 상단 주석의 원래 철학과도 일치)
+#
+#   [수치 근거 — 시각장애인 보행 특성 연구]
+#   · 독립 보행 시각장애인의 평균 보행속도는 약 1.0~1.44 m/s로 정안인보다 느리고,
+#     시야가 완전히 차단된 조건에서는 0.84 m/s 수준까지 떨어진다.
+#     (Hallemans et al. 2010, Gait & Posture; Clark-Carter et al. 1986 등)
+#   · 시각장애인 보행보조장치(ETA) 평가 연구들은 "장애물을 최소 1.5 m 거리에서
+#     감지·인지"할 수 있어야 안전한 대응이 가능하다고 본다.
+#     (Nature Scientific Reports 2026; medRxiv 2025 ETA wayfinding 연구)
+#   · 음성 안내는 "재생 + 청취 + 인지 + 정지"에 통상 1~2초가 걸린다.
+#     보수적으로 보행속도 1.0 m/s × 반응시간 1.5초 ≒ 1.5 m 가 '정지' 하한.
+#
+#   → STOP: 1.5 m (즉시 정지 — ETA 표준 감지/대응 거리와 일치)
+#     WARN: 3.0 m (미리 알림 — 감속·대비 시간 확보, STOP의 약 2배)
+#     그 이상은 안내하지 않음(과다 안내로 인한 피로/무시 방지).
+STOP_DISTANCE_M = 1.5
+WARN_DISTANCE_M = 3.0
+
+# (참고) 음성 문구의 '걸음 수'는 사용자의 거리 체감을 돕는 표시용일 뿐,
+#        안전 등급 판단에는 쓰지 않는다.
 
 DEFAULT_STRIDE_M = 0.7        # 보정 안 했을 때 임시 기본 보폭
 DEFAULT_BODY_WIDTH_M = 0.45   # 어깨너비 기본값 (성인 평균)
@@ -167,12 +186,15 @@ def distance_to_steps(distance_m, stride_m):
     return round(distance_m / stride_m)
 
 
-def assess_safety(distance_m, stride_m):
-    """걸음 수 기준 안전 등급. 반환: "stop" / "warn" / "ok"."""
-    steps = distance_to_steps(distance_m, stride_m)
-    if steps <= STOP_STEPS:
+def assess_safety(distance_m, stride_m=None):
+    """실측 거리(m) 기준 안전 등급. 반환: "stop" / "warn" / "ok".
+
+    stride_m 인자는 하위호환을 위해 받기만 하고 사용하지 않는다.
+    (안전 판단은 보폭과 무관한 절대 거리로 한다 — 위 상수 주석 근거 참조)
+    """
+    if distance_m <= STOP_DISTANCE_M:
         return "stop"
-    elif steps <= WARN_STEPS:
+    elif distance_m <= WARN_DISTANCE_M:
         return "warn"
     else:
         return "ok"
@@ -192,8 +214,45 @@ def avoidance_phrase(situation):
         return ""
 
 
+# ── 음성 조각(gen_voices.py의 키) 매핑 ───────────────────
+#   안내 함수는 (chunks, text) 를 반환한다.
+#     chunks: tts가 순서대로 재생할 wav 키 리스트
+#     text  : dry-run/디버그 화면 출력용 문자열
+LABEL_TO_CHUNK = {
+    "사람": "obj_person",
+    "의자": "obj_chair",
+    "소파": "obj_sofa",
+    "식탁": "obj_table",
+    "모니터": "obj_monitor",
+    "장애물": "obj_unknown",
+}
+AVOID_TO_CHUNK = {
+    "right": "avoid_right",
+    "left": "avoid_left",
+    "either": "avoid_both",
+    # "blocked"는 회피 방향이 없으므로 조각 없음
+}
+CLOCK_TO_CHUNK = {
+    "10시": "clock_10", "11시": "clock_11", "12시": "clock_12",
+    "1시": "clock_1", "2시": "clock_2",
+}
+
+
+def _step_chunk(steps):
+    """걸음 수 → step_N 조각 키. 범위(1~30) 밖이면 가까이로 클램프."""
+    n = max(1, min(30, int(steps)))
+    return f"step_{n}"
+
+
 def build_guidance(obstacle, stride_m, avoid_situation=None):
-    """장애물 정보 → 음성 안내 문구. (기존 로직 유지, WARN 임계값만 7로 영향)"""
+    """장애물 정보 → (chunks, text).
+       chunks: 재생할 음성 조각 키 리스트 / text: 화면 출력용 문자열.
+       안내할 게 없으면 (None, None).
+
+    [stop은 짧게] 위급할수록 빨리 전달돼야 하므로, stop은 거리(걸음 수)를
+    빼고 "정지 + 물체 + 회피"로 압축한다. (예: "정지. 의자. 오른쪽으로 이동.")
+    warn은 여유가 있으므로 거리까지 상세히 안내한다.
+    """
     label = obstacle["label"]
     distance_m = obstacle["distance_m"]
     direction = obstacle["direction"]
@@ -201,40 +260,58 @@ def build_guidance(obstacle, stride_m, avoid_situation=None):
     safety = assess_safety(distance_m, stride_m)
     steps = distance_to_steps(distance_m, stride_m)
 
-    if avoid_situation == "blocked":
-        if safety == "stop":
-            return "정지. 막다른 길입니다."
-        elif safety == "warn":
-            return f"주의. {steps}걸음 앞에 막다른 길."
-        else:
-            return None
-
-    avoid = avoidance_phrase(avoid_situation) if avoid_situation else ""
+    obj_chunk = LABEL_TO_CHUNK.get(label, "obj_unknown")
+    # blocked면 회피 방향이 없음
+    avoid_chunk = None if avoid_situation == "blocked" \
+        else AVOID_TO_CHUNK.get(avoid_situation)
+    avoid_text = avoidance_phrase(avoid_situation) if avoid_situation else ""
 
     if safety == "stop":
-        return f"정지. {direction} {steps}걸음 앞에 {label}.{avoid}"
+        # 짧게: 정지 + 물체 (+ 회피)
+        chunks = ["grade_stop", obj_chunk]
+        text = f"정지. {label}."
+        if avoid_chunk:
+            chunks.append(avoid_chunk)
+            text = f"정지. {label}.{avoid_text}"
+        return chunks, text
+
     elif safety == "warn":
-        return f"주의. {direction} {steps}걸음 앞에 {label}.{avoid}"
-    else:
-        return None
+        # 상세: 주의 + 정면 + N걸음 + 앞에 + 물체 (+ 회피)
+        chunks = ["grade_warn", "pos_front", _step_chunk(steps), "ape", obj_chunk]
+        text = f"주의. {direction} {steps}걸음 앞에 {label}."
+        if avoid_chunk:
+            chunks.append(avoid_chunk)
+            text = f"주의. {direction} {steps}걸음 앞에 {label}.{avoid_text}"
+        return chunks, text
+
+    return None, None
 
 
 def build_narrow_corridor_guidance():
-    """좁은 통로 진입 안내. 폭 숫자는 말하지 않음."""
-    return "좁은 통로, 주의하세요."
+    """좁은 통로 진입 안내. → (chunks, text)"""
+    return ["narrow"], "좁은 통로, 주의하세요."
 
 
 def build_tactile_appear_guidance(clock_direction, distance_m, stride_m):
-    """점자블록이 새로 나타났을 때 안내.
-       예: "11시 방향 세 걸음 앞에 점자블록."
-       거리 측정이 안 됐으면 걸음 수 부분 생략.
-    """
+    """점자블록 출현 안내. → (chunks, text)"""
+    clock_chunk = CLOCK_TO_CHUNK.get(clock_direction)
     if distance_m is not None and distance_m > 0:
         steps = distance_to_steps(distance_m, stride_m)
-        return f"{clock_direction} 방향 {steps}걸음 앞에 점자블록."
-    return f"{clock_direction} 방향에 점자블록."
+        chunks = []
+        if clock_chunk:
+            chunks.append(clock_chunk)
+        chunks += [_step_chunk(steps), "ape", "tactile"]
+        text = f"{clock_direction} 방향 {steps}걸음 앞에 점자블록."
+        return chunks, text
+    chunks = ([clock_chunk] if clock_chunk else []) + ["tactile"]
+    return chunks, f"{clock_direction} 방향에 점자블록."
+
+
+def build_tactile_leaving_guidance():
+    """점자블록 곧 벗어남 안내. → (chunks, text)"""
+    return ["tactile_leaving"], "점자블록 곧 벗어남."
 
 
 def build_tactile_disappear_guidance():
-    """점자블록이 사라졌을 때 안내."""
-    return "점자블록 벗어남."
+    """점자블록이 사라졌을 때 안내. (현재 미사용) → (chunks, text)"""
+    return ["tactile_leaving"], "점자블록 벗어남."
