@@ -42,7 +42,7 @@ from tts import Speaker
 
 # ── 안내 정책 상수 ────────────────────────────────────
 STOP_MAX_REPEATS = 2          # 같은 stop 상태에서 최대 2회까지 발화
-STOP_REPEAT_INTERVAL = 1.0    # stop 두 번 발화 사이 최소 간격(초)
+STOP_REPEAT_INTERVAL = 3.0    # stop 두 번째 발화까지 최소 간격(초) — 너무 잦은 반복 방지
 
 # 점자블록 "곧 벗어남" 판정: 노란 영역의 먼 끝이 이 걸음수 이내면 발화
 TACTILE_LEAVING_STEPS = 4
@@ -108,11 +108,19 @@ def pick_priority_obstacle(obstacles, center_m=None):
 
 def make_obstacle_state_key(target, stride_m, avoid_situation):
     """장애물의 '안내 상태' 키. 이 키가 변하면 새 이벤트로 본다.
-    (라벨, 걸음수, 방향, 안전등급, 회피상황)"""
+
+    핵심: stop(정지) 등급은 거리/방향/회피상황이 프레임마다 흔들려도
+    같은 물체면 같은 이벤트로 묶는다. (근거리 depth 지터로 인한
+    '정지정지정지' 반복 발화를 막기 위함.)
+    재안내는 물체가 사라지거나(키=None) 물체 종류가 바뀔 때만 일어난다.
+    """
     if target is None:
         return None
-    steps = distance_to_steps(target["distance_m"], stride_m)
     safety = assess_safety(target["distance_m"], stride_m)
+    if safety == "stop":
+        # 걸음수/방향/회피를 키에서 제외 → 지터에 둔감
+        return (target["label"], None, None, safety, None)
+    steps = distance_to_steps(target["distance_m"], stride_m)
     return (target["label"], steps, target["direction"], safety, avoid_situation)
 
 
