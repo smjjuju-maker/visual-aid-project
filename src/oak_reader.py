@@ -14,6 +14,13 @@ OAK-D-Lite 파이프라인 생성 + 장애물 거리/방향 + 점자블록 + 좁
   - setLeftRightCheck(True): CAM_A 정렬에는 LR Check 필수
   - maxUsbSpeed=HIGH: 노트북 USB 환경 안정화
   - RGB preview(300x300)를 점자블록 색 검출에도 같이 사용 (선택지 A)
+
+[반응 속도 개선]
+  - TARGET_FPS 10 → 20: 프레임을 더 자주 받아 첫 반응 지연 감소.
+  - SMOOTHING_WINDOW 5 → 3: 이동평균이 빨리 수렴.
+  - 가까운(위급) 장애물은 평균을 기다리지 않고 실측값을 즉시 사용
+    (IMMEDIATE_DISTANCE_M 이내). 충돌 임박 시 한 프레임 만에 안내됨.
+    먼 장애물은 그대로 이동평균으로 부드럽게 처리.
 """
 
 import os
@@ -48,9 +55,15 @@ INDOOR_RELEVANT = {
 }
 
 # ── 설정값 ────────────────────────────────────────────
-TARGET_FPS = 15
+TARGET_FPS = 20
 CONFIDENCE_THRESHOLD = 0.5
 SMOOTHING_WINDOW = 3
+
+# 가까운(위급) 장애물은 이 거리 이내면 이동평균을 건너뛰고 실측값을 즉시 사용.
+# 충돌 임박 시 평균이 채워지길 기다리지 않아 반응이 한 프레임으로 빨라진다.
+# 헛경고(노이즈 1프레임에 반응)가 거슬리면 1.2 정도로 낮춰 진짜 가까울 때만.
+# (step_converter.STOP_DISTANCE_M = 1.5 와 맞춤)
+IMMEDIATE_DISTANCE_M = 1.5
 
 # ── 회피 판단 기준 ────────────────────────────────────
 CLEAR_THRESHOLD_M = 1.5
@@ -209,6 +222,10 @@ class OakReader:
     def get_obstacles(self, front_half_width_m=0.3):
         """현재 프레임의 실내 관련 장애물 목록.
         front_half_width_m: '정면' 판정 좌우 반폭(m). main에서 어깨너비 기반으로 넘김.
+
+        [반응 속도] 가까운(위급) 장애물은 이동평균을 건너뛰고 실측값을 즉시
+        사용한다(IMMEDIATE_DISTANCE_M 이내). 충돌 임박 시 한 프레임 만에 안내.
+        먼 장애물은 이동평균으로 부드럽게 처리해 깜빡임을 막는다.
         """
         in_det = self.det_queue.tryGet()
         if in_det is None:
@@ -232,7 +249,12 @@ class OakReader:
 
             history = self._distance_history[label_ko]
             history.append(distance_m)
-            smoothed_m = sum(history) / len(history)
+            # 위급 거리면 평균을 기다리지 않고 실측값을 즉시 사용(반응 우선),
+            # 멀면 이동평균으로 부드럽게(안정 우선).
+            if distance_m <= IMMEDIATE_DISTANCE_M:
+                smoothed_m = distance_m
+            else:
+                smoothed_m = sum(history) / len(history)
 
             obstacles.append({
                 "label": label_ko,
