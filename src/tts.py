@@ -85,33 +85,28 @@ class Speaker:
         return os.path.join(VOICES_DIR, f"{key}.mp3")
 
     def _play_sequence(self, chunks, my_gen):
-        """조각들을 '한 번의 mpg123 호출'로 연속 재생한다.
-        파일을 하나씩 따로 띄우면 단어마다 프로세스 지연 + 무음이 끼어
-        뚝뚝 끊긴다. mpg123은 인자로 받은 mp3들을 한 프로세스에서
-        연달아(거의 끊김 없이) 재생하므로 멘트가 짧고 빨라진다.
-        세대(my_gen)가 바뀌면(인터럽트) 프로세스를 죽여 즉시 멈춘다."""
+        """조각들을 순서대로 aplay. 세대(my_gen)가 바뀌면 즉시 중단."""
         self._speaking = True
         try:
-            if my_gen != self._gen:
-                return                          # 시작 전에 이미 인터럽트됨
-            paths = [self._wav(k) for k in chunks]
-            paths = [p for p in paths if os.path.exists(p)]
-            if not paths:
-                return
-            try:
-                proc = subprocess.Popen(
-                    ["mpg123", "-q"] + paths,   # 조각 전부를 한 번에
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except FileNotFoundError:
-                print("[TTS 오류] mpg123 없음 (sudo apt-get install -y mpg123)")
-                return
-            with self._lock:
-                self._proc = proc
-            proc.wait()
-            with self._lock:
-                if self._proc is proc:
+            for key in chunks:
+                if my_gen != self._gen:
+                    return                      # 인터럽트됨
+                path = self._wav(key)
+                if not os.path.exists(path):
+                    continue                    # 없는 조각은 건너뜀
+                try:
+                    proc = subprocess.Popen(
+                        ["mpg123", "-q", path],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except FileNotFoundError:
+                    print("[TTS 오류] mpg123 없음 (sudo apt-get install -y mpg123)")
+                    return
+                with self._lock:
+                    self._proc = proc
+                proc.wait()
+                with self._lock:
                     self._proc = None
         finally:
             if my_gen == self._gen:
