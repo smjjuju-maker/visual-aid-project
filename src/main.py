@@ -6,10 +6,15 @@ main.py
 [안내 정책]
   - 장애물(stop): 같은 상태일 때 최대 2회만 발화 후 조용. 상태가 바뀌면 리셋.
   - 장애물(warn): 같은 상태일 때 1회만. 상태가 바뀌면 다시.
-  - 안내 최소 간격(쿨다운): 카메라가 1초에 여러 번(예: 20fps) 도므로, 같은
-    상황이 유지되는 동안 매 프레임 안내가 쏟아지지 않도록 마지막 안내로부터
-    일정 시간이 지나야 다음 안내를 내보낸다. 이것이 "정지 정지 정지" 폭주와
-    누적 지연을 막는 핵심이다. (stop은 짧게, warn은 길게)
+  - 상태 키에 '걸음수'는 넣지 않는다. 같은 물체에 다가가는 동안 걸음수가
+    4→3→2→1로 줄어도 매번 새 안내가 나가지 않게 하기 위함이다. 안내는
+    '등급(warn↔stop)·라벨·방향·회피'가 바뀔 때만 새로 나간다.
+      예) 처음 감지: "주의, 4걸음 앞 의자" 1회 →
+          (다가가는 동안 조용) →
+          1.0m 안에 들어와 stop 등급이 되는 순간: "정지" 1회
+  - 안내 최소 간격(쿨다운): 카메라가 1초에 여러 번(예: 20fps) 돌므로, 같은
+    상태가 유지되는 동안 매 프레임 안내가 쏟아지지 않도록 마지막 발화로부터
+    일정 시간이 지나야 다음 안내를 내보낸다. (stop은 짧게, warn은 길게)
   - 겹침 방지: 안내는 say()로 보낸다. 정지(stop)는 약한 안내(warn)를 끊고
     끼어들지만 stop끼리는 안 끊는다. 그 외는 재생 중이면 tts가 '최신 하나'만
     펜딩 슬롯에 보류했다 이어 재생한다. (tts.py가 처리)
@@ -51,12 +56,12 @@ STOP_REPEAT_INTERVAL = 1.0    # stop 두 번 발화 사이 최소 간격(초)
 
 # ── 안내 최소 간격(쿨다운) ────────────────────────────
 #   카메라 루프는 1초에 여러 번(예: 20fps) 돈다. 같은 상황이 유지되는 동안
-#   매 프레임 안내를 던지면 "정지 정지 정지…"처럼 폭주하고, 펜딩이 누적돼
-#   실제 상황보다 안내가 늦어진다(지연). 그래서 마지막으로 '실제 발화'한
-#   시각으로부터 아래 간격이 지나기 전에는 새 안내를 내보내지 않는다.
+#   매 프레임 안내를 던지면 폭주하고 펜딩이 누적돼 안내가 늦어진다(지연).
+#   그래서 마지막으로 '실제 발화'한 시각으로부터 아래 간격이 지나기 전에는
+#   같은 상태의 새 안내를 내보내지 않는다.
 #     · stop: 위급하므로 비교적 짧게(자주 갱신 허용)
 #     · warn: 여유 있으므로 길게(불필요한 반복 억제)
-#   상태 키가 '바뀌면'(다른 장애물/방향 등) 이 쿨다운과 무관하게 즉시 안내한다.
+#   상태 키가 '바뀌면'(등급/라벨/방향/회피) 쿨다운과 무관하게 즉시 안내한다.
 STOP_SPEAK_COOLDOWN = 1.5     # 같은 정지 상황 반복 안내 최소 간격(초)
 WARN_SPEAK_COOLDOWN = 3.0     # 같은 주의 상황 반복 안내 최소 간격(초)
 
@@ -114,12 +119,16 @@ def pick_priority_obstacle(obstacles, center_m=None):
 
 def make_obstacle_state_key(target, stride_m, avoid_situation):
     """장애물의 '안내 상태' 키. 이 키가 변하면 새 이벤트로 본다.
-    (라벨, 걸음수, 방향, 안전등급, 회피상황)"""
+
+    [걸음수 제외] 같은 물체에 다가가는 동안 걸음수(4→3→2→1)가 줄어도
+    같은 이벤트로 보고 반복 안내하지 않는다. 안내가 새로 나가는 경우는
+    등급(warn↔stop)·라벨·방향·회피상황이 바뀔 때뿐이다.
+    (거리/걸음수 변화만으로는 새 안내를 만들지 않는다.)
+    """
     if target is None:
         return None
-    steps = distance_to_steps(target["distance_m"], stride_m)
     safety = assess_safety(target["distance_m"], stride_m)
-    return (target["label"], steps, target["direction"], safety, avoid_situation)
+    return (target["label"], target["direction"], safety, avoid_situation)
 
 
 def main():
@@ -227,9 +236,9 @@ def main():
 
                     # ─────────────────────────────────────────────────
                     # (1) 장애물 안내
-                    #     - 상태가 바뀌면 즉시 안내(쿨다운 무시).
-                    #     - 같은 상태가 유지되면 STOP/WARN_SPEAK_COOLDOWN 간격을
-                    #       둬서 매 프레임 폭주하지 않게 한다.
+                    #     - 상태(등급/라벨/방향/회피)가 바뀌면 즉시 안내.
+                    #     - 같은 상태가 유지되면 쿨다운 간격을 둬서 폭주 방지.
+                    #     - 걸음수가 줄어드는 것만으로는 새 안내를 만들지 않는다.
                     # ─────────────────────────────────────────────────
                     center_m = clearance["center_m"] if clearance else None
                     target = pick_priority_obstacle(obstacles, center_m=center_m)
@@ -248,7 +257,7 @@ def main():
                         current_obstacle_key = None
                         obstacle_speak_count = 0
                     else:
-                        safety = new_key[3]   # "stop" | "warn" | "ok"
+                        safety = new_key[2]   # "stop" | "warn" | "ok"
                         key_changed = (new_key != current_obstacle_key)
 
                         if key_changed:
@@ -267,7 +276,7 @@ def main():
 
                             # 발화 조건:
                             #   · 상태가 막 바뀌었으면(key_changed) 즉시 1회 허용.
-                            #   · 같은 상태면 발화 횟수가 한도 미만 + 쿨다운 경과.
+                            #   · 같은 상태면 발화 횟수 한도 미만 + 쿨다운 경과.
                             can_speak = False
                             if key_changed:
                                 can_speak = True

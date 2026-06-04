@@ -29,22 +29,20 @@ STRIDE_FILE = os.path.join(SCRIPT_DIR, "stride_config.json")
 #   기존엔 "걸음 수"로 안전을 판단했으나, 걸음 수는 보폭에 따라 같은 위험거리가
 #   사람마다 다른 거리로 환산되는 문제가 있다(보폭 짧은 사람일수록 더 일찍 경고).
 #   안전은 보폭과 무관한 물리량이므로 "실측 거리(m)"로 판단하는 것이 옳다.
-#   (이 모듈 상단 주석의 원래 철학과도 일치)
 #
 #   [수치 근거 — 시각장애인 보행 특성 연구]
 #   · 독립 보행 시각장애인의 평균 보행속도는 약 1.0~1.44 m/s로 정안인보다 느리고,
 #     시야가 완전히 차단된 조건에서는 0.84 m/s 수준까지 떨어진다.
-#     (Hallemans et al. 2010, Gait & Posture; Clark-Carter et al. 1986 등)
 #   · 시각장애인 보행보조장치(ETA) 평가 연구들은 "장애물을 최소 1.5 m 거리에서
 #     감지·인지"할 수 있어야 안전한 대응이 가능하다고 본다.
-#     (Nature Scientific Reports 2026; medRxiv 2025 ETA wayfinding 연구)
 #   · 음성 안내는 "재생 + 청취 + 인지 + 정지"에 통상 1~2초가 걸린다.
-#     보수적으로 보행속도 1.0 m/s × 반응시간 1.5초 ≒ 1.5 m 가 '정지' 하한.
 #
-#   → STOP: 1.5 m (즉시 정지 — ETA 표준 감지/대응 거리와 일치)
-#     WARN: 3.0 m (미리 알림 — 감속·대비 시간 확보, STOP의 약 2배)
-#     그 이상은 안내하지 않음(과다 안내로 인한 피로/무시 방지).
-STOP_DISTANCE_M = 1.5
+#   [현재 설정] 사용자 요청으로 STOP을 1.0 m로 운용한다.
+#     WARN: 3.0 m (미리 알림 — 감속·대비 시간 확보)
+#     STOP: 1.0 m (즉시 정지 — 더 가까이 접근해야 정지 안내)
+#     ※ 1.0 m는 권장 안전거리(1.5 m)보다 짧아 반응 여유가 줄어든다.
+#       보행 속도가 빠른 사용자에겐 1.5 m 복귀를 고려할 것.
+STOP_DISTANCE_M = 1.0
 WARN_DISTANCE_M = 3.0
 
 # (참고) 음성 문구의 '걸음 수'는 사용자의 거리 체감을 돕는 표시용일 뿐,
@@ -90,11 +88,6 @@ def estimate_shoulder_width(height_cm):
 
 def calibrate_user():
     """보정 루틴: 보폭(걸은 거리/걸음수) + 어깨너비(키 입력) 측정.
-
-    [사용 방법]
-      1. 줄자로 바닥에 정확한 거리(예: 10m)를 미리 표시해둔다.
-      2. 사용자가 그 거리를 평소처럼 걷는다.
-      3. 걸은 거리와 걸음 수, 그리고 키를 입력하면 보폭과 어깨너비가 계산된다.
 
     반환: (stride_m, body_width_m)
     """
@@ -164,18 +157,12 @@ def get_user_stride(force_recalibrate=False):
 
 
 def get_narrow_threshold(body_width_m):
-    """좁은 통로 판단 기준 거리 = 어깨너비 × 배수.
-    양옆 거리가 둘 다 이 값 이내일 때 '벽/책상이 가깝다'고 본다.
-    실측(키155, 어깨0.40, 책상사이 양옆 0.9~1.2m) 기준으로 배수 3.0 시작.
-    키 큰 사람은 어깨너비가 커서 자동으로 더 넉넉해진다."""
+    """좁은 통로 판단 기준 거리 = 어깨너비 × 배수."""
     return body_width_m * NARROW_SIDE_RATIO
 
 
 def get_front_half_width(body_width_m):
-    """'정면(진행 경로)'으로 볼 좌우 반폭(m).
-    어깨너비 + 여유의 절반. 이 폭 안의 장애물만 부딪힐 경로로 본다.
-    예: 어깨너비 0.45 + 여유 0.20 = 0.65 → 반폭 0.325m
-    """
+    """'정면(진행 경로)'으로 볼 좌우 반폭(m). 어깨너비 + 여유의 절반."""
     return (body_width_m + BODY_SIDE_MARGIN_M) / 2.0
 
 
@@ -190,7 +177,7 @@ def assess_safety(distance_m, stride_m=None):
     """실측 거리(m) 기준 안전 등급. 반환: "stop" / "warn" / "ok".
 
     stride_m 인자는 하위호환을 위해 받기만 하고 사용하지 않는다.
-    (안전 판단은 보폭과 무관한 절대 거리로 한다 — 위 상수 주석 근거 참조)
+    (안전 판단은 보폭과 무관한 절대 거리로 한다)
     """
     if distance_m <= STOP_DISTANCE_M:
         return "stop"
@@ -215,9 +202,6 @@ def avoidance_phrase(situation):
 
 
 # ── 음성 조각(gen_voices.py의 키) 매핑 ───────────────────
-#   안내 함수는 (chunks, text) 를 반환한다.
-#     chunks: tts가 순서대로 재생할 wav 키 리스트
-#     text  : dry-run/디버그 화면 출력용 문자열
 LABEL_TO_CHUNK = {
     "사람": "obj_person",
     "의자": "obj_chair",
@@ -246,12 +230,10 @@ def _step_chunk(steps):
 
 def build_guidance(obstacle, stride_m, avoid_situation=None):
     """장애물 정보 → (chunks, text).
-       chunks: 재생할 음성 조각 키 리스트 / text: 화면 출력용 문자열.
        안내할 게 없으면 (None, None).
 
     [stop은 짧게] 위급할수록 빨리 전달돼야 하므로, stop은 거리(걸음 수)를
-    빼고 "정지 + 물체 + 회피"로 압축한다. (예: "정지. 의자. 오른쪽으로 이동.")
-    warn은 여유가 있으므로 거리까지 상세히 안내한다.
+    빼고 "정지 + 물체 + 회피"로 압축한다. warn은 거리까지 상세히 안내한다.
     """
     label = obstacle["label"]
     distance_m = obstacle["distance_m"]
@@ -261,7 +243,6 @@ def build_guidance(obstacle, stride_m, avoid_situation=None):
     steps = distance_to_steps(distance_m, stride_m)
 
     obj_chunk = LABEL_TO_CHUNK.get(label, "obj_unknown")
-    # blocked면 회피 방향이 없음
     avoid_chunk = None if avoid_situation == "blocked" \
         else AVOID_TO_CHUNK.get(avoid_situation)
     avoid_text = avoidance_phrase(avoid_situation) if avoid_situation else ""
@@ -314,7 +295,6 @@ def build_tactile_leaving_guidance():
 
 def build_tactile_query_guidance(tactile, stride_m):
     """버튼을 눌렀을 때 점자블록 상태 안내. → (chunks, text)
-       tactile: detect_tactile_paving() 결과(dict) 또는 None.
        있으면 방향·거리까지, 없으면 "주변에 점자블록이 없습니다."
     """
     if tactile is None or not tactile.get("present"):
