@@ -9,6 +9,9 @@ tts.py
       ["grade_warn","pos_front","step_2","ape","obj_chair","avoid_right"]
     → 주의. 정면. 두 걸음. 앞에. 의자. 오른쪽으로 이동.
   - 재생은 백그라운드 스레드에서 하여 메인 루프(카메라)를 막지 않는다.
+  - 한 안내의 여러 조각은 단일 mpg123 프로세스로 연속 재생한다(청크 간 갭 제거).
+  - 맨 앞에 짧은 무음(_silence.mp3)을 끼워 블루투스 스피커를 미리 깨운다
+    (절전에서 깨어나며 첫 멘트 앞부분이 잘리는 문제 방지).
 
 [인터럽트 — 핵심]
   - say_now()(긴급/정지용)는 현재 재생 중인 조각 시퀀스를 즉시 중단하고
@@ -17,8 +20,9 @@ tts.py
     "안내 재생 중 빨리 걸어 충돌 임박" 상황에서 stop이 바로 끼어든다.
 
 [환경]
-  - 라즈베리파이 + 블루투스 골전도 이어폰(OS 기본 출력 장치).
+  - 라즈베리파이 + 블루투스 골전도 이어폰/스피커(OS 기본 출력 장치).
   - 재생기: mpg123 (mp3). 라파에 설치 필요: sudo apt-get install -y mpg123
+  - 무음 파일: voices/_silence.mp3 (0.4초). 없으면 워밍업 없이 동작.
   - dry_run=True 면 소리 없이 화면 출력만(PC 테스트).
 """
 
@@ -66,7 +70,7 @@ def _normalize(item):
 
 
 class Speaker:
-    """미리 만든 wav 조각을 aplay로 순차 재생. say_now는 인터럽트."""
+    """미리 만든 mp3 조각을 mpg123으로 연속 재생. say_now는 인터럽트."""
 
     def __init__(self, dry_run=False):
         self.dry_run = dry_run
@@ -76,7 +80,7 @@ class Speaker:
         self._speaking = False
         if not dry_run and not os.path.isdir(VOICES_DIR):
             print(f"[TTS] voices 폴더 없음: {VOICES_DIR}")
-            print("      gen_voices.py 를 먼저 실행해 wav를 만들어 주세요.")
+            print("      gen_voices.py 를 먼저 실행해 mp3를 만들어 주세요.")
 
     def is_speaking(self):
         return self._speaking
@@ -85,29 +89,39 @@ class Speaker:
         return os.path.join(VOICES_DIR, f"{key}.mp3")
 
     def _play_sequence(self, chunks, my_gen):
-        """조각들을 순서대로 aplay. 세대(my_gen)가 바뀌면 즉시 중단."""
+        """조각들을 단일 mpg123 프로세스로 연속 재생(청크 간 갭 제거).
+           세대(my_gen)가 바뀌면 즉시 중단."""
         self._speaking = True
         try:
+            if my_gen != self._gen:
+                return                          # 시작 전에 이미 인터럽트됨
+
+            # 존재하는 조각만 경로로 변환
+            paths = []
+            silence = self._wav("_silence")
+            if os.path.exists(silence):
+                paths.append(silence)           # 맨 앞: 스피커 깨우기용 무음
             for key in chunks:
-                if my_gen != self._gen:
-                    return                      # 인터럽트됨
-                path = self._wav(key)
-                if not os.path.exists(path):
-                    continue                    # 없는 조각은 건너뜀
-                try:
-                    proc = subprocess.Popen(
-                        ["mpg123", "-q", path],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                except FileNotFoundError:
-                    print("[TTS 오류] mpg123 없음 (sudo apt-get install -y mpg123)")
-                    return
-                with self._lock:
-                    self._proc = proc
-                proc.wait()
-                with self._lock:
-                    self._proc = None
+                p = self._wav(key)
+                if os.path.exists(p):
+                    paths.append(p)             # 없는 조각은 건너뜀
+            if not paths:
+                return
+
+            try:
+                proc = subprocess.Popen(
+                    ["mpg123", "-q"] + paths,    # 여러 파일 → 한 프로세스로 연속 재생
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except FileNotFoundError:
+                print("[TTS 오류] mpg123 없음 (sudo apt-get install -y mpg123)")
+                return
+            with self._lock:
+                self._proc = proc
+            proc.wait()
+            with self._lock:
+                self._proc = None
         finally:
             if my_gen == self._gen:
                 self._speaking = False

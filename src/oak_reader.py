@@ -48,9 +48,9 @@ INDOOR_RELEVANT = {
 }
 
 # ── 설정값 ────────────────────────────────────────────
-TARGET_FPS = 10
+TARGET_FPS = 15
 CONFIDENCE_THRESHOLD = 0.5
-SMOOTHING_WINDOW = 5
+SMOOTHING_WINDOW = 3
 
 # ── 회피 판단 기준 ────────────────────────────────────
 CLEAR_THRESHOLD_M = 1.5
