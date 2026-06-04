@@ -63,11 +63,11 @@ SMOOTHING_WINDOW = 3
 # 충돌 임박 시 평균이 채워지길 기다리지 않아 반응이 한 프레임으로 빨라진다.
 # 헛경고(노이즈 1프레임에 반응)가 거슬리면 1.2 정도로 낮춰 진짜 가까울 때만.
 # (step_converter.STOP_DISTANCE_M = 1.5 와 맞춤)
-IMMEDIATE_DISTANCE_M = 1.5
+IMMEDIATE_DISTANCE_M = 1.0
 
 # ── 회피 판단 기준 ────────────────────────────────────
 CLEAR_THRESHOLD_M = 1.5
-SIDE_DIFF_THRESHOLD_M = 0.8
+SIDE_DIFF_THRESHOLD_M = 1.0
 
 # ── 좁은 통로 판단 기준 ───────────────────────────────
 #   narrow_side_m: 양옆이 이 거리 이내면 "벽/책상이 가깝다".
