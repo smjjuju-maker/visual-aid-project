@@ -14,18 +14,25 @@ tts.py
     (절전에서 깨어나며 첫 멘트 앞부분이 잘리는 문제 방지). 단, 연속 재생
     체인의 첫 안내에만 붙인다(이미 깨어있는 이어 재생엔 불필요).
 
-[겹침 방지 — 펜딩 슬롯(핵심)]
-  - say()는 진행 중인 안내를 끊지 않는다(끝까지 재생).
-  - 재생 중에 새 say()가 오면 큐에 쌓지 않고 '펜딩 슬롯 1칸'을 최신 것으로
-    계속 덮어쓴다. 재생이 끝나면 펜딩에 남은 '가장 최신' 하나만 이어서 재생.
-    → 안내가 누적되어 지연되는 일 없이, 항상 최신 상황만 안내된다.
-  - 안전장치: 펜딩에 stop(정지)이 대기 중이면, 그보다 약한 warn 등이
-    덮어쓰지 못한다(stop은 stop 또는 더 최신 stop으로만 교체).
+[겹침/우선순위 정책 — 핵심]
+  say(item)으로 들어오는 안내는 stop(정지)인지 아닌지에 따라 다르게 처리한다.
+
+  ┌ 들어온 게 stop(정지: 첫 조각이 grade_stop) ────────────────────────┐
+  │ · 지금 재생 중인 게 stop이 아니면(warn 등) → 즉시 끊고 정지를 재생.   │
+  │   (정지는 위험 상황이라 약한 안내를 끊어도 된다)                      │
+  │ · 지금 재생 중인 게 이미 stop이면 → 끊지 않고 펜딩 슬롯에 최신 stop으로│
+  │   보류했다가 이어서 재생. (stop끼리는 안 끊어 겹침/버벅임 방지)        │
+  └────────────────────────────────────────────────────────────────────┘
+  ┌ 들어온 게 일반(warn 등) ────────────────────────────────────────────┐
+  │ · 재생 중이면 끊지 않고 펜딩 슬롯을 '최신'으로 덮어썼다가 끝나면 재생. │
+  │   단, 펜딩에 stop이 대기 중이면 warn은 그걸 덮어쓰지 못한다(보호).     │
+  │ · 재생 중이 아니면 바로 재생.                                         │
+  └────────────────────────────────────────────────────────────────────┘
+  → 진행 중 안내가 누적되어 지연되지 않고(최신만 유지), 정지는 빠르게 끼어든다.
 
 [인터럽트]
   - say_now()는 현재 재생을 즉시 중단하고 새 안내를 처음부터 재생한다.
-    (현재는 종료 안내(sys_end) 같은 즉시성 필요 케이스용. 장애물 안내는
-     겹침 방지를 위해 say()의 펜딩 슬롯 방식을 쓴다.)
+    (버튼 응답·종료 안내 등 즉시성이 필요한 경우용.)
 
 [환경]
   - 라즈베리파이 + 블루투스 골전도 이어폰/스피커(OS 기본 출력 장치).
@@ -84,7 +91,8 @@ def _is_stop(chunks):
 
 class Speaker:
     """미리 만든 mp3 조각을 mpg123으로 연속 재생.
-       say는 진행 중이면 양보하고 '최신'만 펜딩 슬롯에 보류했다 이어 재생.
+       정지(stop)는 일반 안내를 끊고 끼어들지만, stop끼리는 안 끊는다.
+       일반 안내는 진행 중이면 펜딩 슬롯에 '최신'만 보류했다 이어 재생.
     """
 
     def __init__(self, dry_run=False):
@@ -94,6 +102,7 @@ class Speaker:
         self._gen = 0                 # 재생 세대(인터럽트/새 재생 식별)
         self._speaking = False
         self._pending = None          # 재생 중 들어온 '최신' 안내 1개(chunks)
+        self._current_is_stop = False # 지금 재생 중인 안내가 stop인지
         if not dry_run and not os.path.isdir(VOICES_DIR):
             print(f"[TTS] voices 폴더 없음: {VOICES_DIR}")
             print("      gen_voices.py 를 먼저 실행해 mp3를 만들어 주세요.")
@@ -149,51 +158,79 @@ class Speaker:
                     if self._pending is not None:
                         chunks = self._pending
                         self._pending = None
+                        self._current_is_stop = _is_stop(chunks)
                         continue                # 같은 스레드에서 최신 것 이어 재생
                     self._speaking = False
+                    self._current_is_stop = False
                     return
         finally:
             # 예외 등으로 빠져나갈 때도 현재 세대면 speaking 해제(영구 잠김 방지)
             with self._lock:
                 if my_gen == self._gen:
                     self._speaking = False
+                    self._current_is_stop = False
+
+    def _begin_new_playback(self, chunks):
+        """(lock 잡은 상태에서 호출) 새 재생을 시작할 준비를 하고 my_gen 반환."""
+        self._gen += 1
+        self._pending = None
+        self._speaking = True
+        self._current_is_stop = _is_stop(chunks)
+        return self._gen
 
     def _start(self, chunks, interrupt):
         """재생 시작.
            interrupt=True : 진행 중 재생을 끊고 새로 시작(즉시).
-           interrupt=False: 재생 중이면 펜딩 슬롯에 '최신'으로 보류(양보).
+           interrupt=False: 정지/우선순위 정책에 따라 끼어들기 또는 펜딩 보류.
         """
         with self._lock:
             if interrupt:
-                self._gen += 1                  # 기존 시퀀스 무효화
-                self._pending = None            # 대기 중 일반 안내 폐기
                 if self._proc is not None:
                     try:
-                        self._proc.kill()       # 재생 중 mpg123 즉시 종료
+                        self._proc.kill()
                     except Exception:
                         pass
                     self._proc = None
-                self._speaking = True
-                my_gen = self._gen
-            else:
-                if self._speaking:
-                    # 재생 중 → 큐에 쌓지 않고 펜딩 슬롯을 최신으로 덮어쓴다.
-                    # 단, 대기 중이 stop이면 약한 안내(warn 등)는 덮어쓰지 못함.
-                    incoming_stop = _is_stop(chunks)
-                    pending_stop = _is_stop(self._pending) if self._pending else False
-                    if incoming_stop or not pending_stop:
-                        self._pending = list(chunks)
+                my_gen = self._begin_new_playback(chunks)
+                t = threading.Thread(target=self._play_sequence,
+                                     args=(chunks, my_gen), daemon=True)
+                t.start()
+                return
+
+            incoming_stop = _is_stop(chunks)
+
+            if self._speaking:
+                if incoming_stop and not self._current_is_stop:
+                    # 정지가 들어왔고 지금 재생 중인 건 약한 안내(warn 등)
+                    # → 끊고 즉시 정지를 재생. (stop은 stop을 끊지 않으므로
+                    #   현재가 stop일 땐 이 분기로 오지 않는다.)
+                    if self._proc is not None:
+                        try:
+                            self._proc.kill()
+                        except Exception:
+                            pass
+                        self._proc = None
+                    my_gen = self._begin_new_playback(chunks)
+                    t = threading.Thread(target=self._play_sequence,
+                                         args=(chunks, my_gen), daemon=True)
+                    t.start()
                     return
-                self._gen += 1
-                self._pending = None
-                self._speaking = True
-                my_gen = self._gen
+
+                # 그 외(재생 중): 펜딩 슬롯을 최신으로 덮어쓴다.
+                # 단, 대기 중이 stop이면 약한 안내(warn 등)는 덮어쓰지 못함.
+                pending_stop = _is_stop(self._pending) if self._pending else False
+                if incoming_stop or not pending_stop:
+                    self._pending = list(chunks)
+                return
+
+            # 재생 중 아님 → 바로 시작
+            my_gen = self._begin_new_playback(chunks)
         t = threading.Thread(target=self._play_sequence,
                              args=(chunks, my_gen), daemon=True)
         t.start()
 
     def say(self, item):
-        """일반 안내. 재생 중이면 끊지 않고 펜딩 슬롯에 최신만 보류했다 이어 재생."""
+        """안내 재생. 정지는 약한 안내를 끊고 끼어들고, 그 외는 펜딩 슬롯 정책."""
         chunks, text = _normalize(item)
         if not chunks and not text:
             return
@@ -204,7 +241,7 @@ class Speaker:
 
     def say_now(self, item):
         """즉시 안내. 진행 중 재생을 끊고 즉시 재생(인터럽트).
-           (종료 안내 등 즉시성이 꼭 필요한 경우에만 사용)"""
+           (버튼 응답·종료 안내 등 즉시성이 꼭 필요한 경우에 사용)"""
         chunks, text = _normalize(item)
         if not chunks and not text:
             return
