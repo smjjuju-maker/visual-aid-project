@@ -4,18 +4,23 @@ main.py
 시각 보조 시스템 메인 루프.
 
 [안내 정책]
-  - 장애물(stop): 같은 상태(거리/방향/라벨/등급)일 때 최대 2회만 발화 후 조용.
-                  상태가 바뀌면 카운터 리셋.
+  - 장애물(stop): 같은 상태일 때 최대 2회만 발화 후 조용. 상태가 바뀌면 리셋.
   - 장애물(warn): 같은 상태일 때 1회만. 상태가 바뀌면 다시.
-  - 점자블록(자동): "있다"가 새로 확정될 때 1회 + 노란 영역의 먼 끝이
-                    4걸음 이내가 됐을 때 "곧 벗어남" 1회. 사후 안내는 없음.
-  - 좁은 통로: 진입 시 1회. (위급 장애물이 그 프레임에 안내됐다면 보류)
+  - 안내 최소 간격(쿨다운): 카메라가 1초에 여러 번(예: 20fps) 도므로, 같은
+    상황이 유지되는 동안 매 프레임 안내가 쏟아지지 않도록 마지막 안내로부터
+    일정 시간이 지나야 다음 안내를 내보낸다. 이것이 "정지 정지 정지" 폭주와
+    누적 지연을 막는 핵심이다. (stop은 짧게, warn은 길게)
+  - 겹침 방지: 안내는 say()로 보낸다. 정지(stop)는 약한 안내(warn)를 끊고
+    끼어들지만 stop끼리는 안 끊는다. 그 외는 재생 중이면 tts가 '최신 하나'만
+    펜딩 슬롯에 보류했다 이어 재생한다. (tts.py가 처리)
+  - 점자블록(자동): 자동 안내 없음. 버튼(GPIO17)을 누를 때만 안내.
+  - 좁은 통로: 진입 시 1회. (위급 장애물이 그 프레임에 안내됐거나 재생 중이면 보류)
   - 모든 판정은 깜빡임 방지 위해 hysteresis (연속 N프레임 확정) 적용.
 
 [흐름]
   1. 사용자 보폭 + 어깨너비 확보
   2. OAK-D-Lite 연결
-  3. 반복: 장애물 → 점자블록 → 좁은 통로 순으로 이벤트 판정 후 안내
+  3. 반복: 장애물 → 점자블록(버튼) → 좁은 통로 순으로 이벤트 판정 후 안내
 
 [실행]
   python main.py                # 매번 새로 보정
@@ -44,6 +49,17 @@ from tts import Speaker
 STOP_MAX_REPEATS = 2          # 같은 stop 상태에서 최대 2회까지 발화
 STOP_REPEAT_INTERVAL = 1.0    # stop 두 번 발화 사이 최소 간격(초)
 
+# ── 안내 최소 간격(쿨다운) ────────────────────────────
+#   카메라 루프는 1초에 여러 번(예: 20fps) 돈다. 같은 상황이 유지되는 동안
+#   매 프레임 안내를 던지면 "정지 정지 정지…"처럼 폭주하고, 펜딩이 누적돼
+#   실제 상황보다 안내가 늦어진다(지연). 그래서 마지막으로 '실제 발화'한
+#   시각으로부터 아래 간격이 지나기 전에는 새 안내를 내보내지 않는다.
+#     · stop: 위급하므로 비교적 짧게(자주 갱신 허용)
+#     · warn: 여유 있으므로 길게(불필요한 반복 억제)
+#   상태 키가 '바뀌면'(다른 장애물/방향 등) 이 쿨다운과 무관하게 즉시 안내한다.
+STOP_SPEAK_COOLDOWN = 1.5     # 같은 정지 상황 반복 안내 최소 간격(초)
+WARN_SPEAK_COOLDOWN = 3.0     # 같은 주의 상황 반복 안내 최소 간격(초)
+
 # 점자블록 "곧 벗어남" 판정: 노란 영역의 먼 끝이 이 걸음수 이내면 발화
 TACTILE_LEAVING_STEPS = 4
 
@@ -61,16 +77,8 @@ def pick_priority_obstacle(obstacles, center_m=None):
 
     [정책]
       1) MobileNet이 정면에서 잡은 물체가 있으면 그중 가장 가까운 것.
-         → 거리도 라벨(예: "의자")도 그 물체 기준.
-      2) 정면 검출은 없지만 depth상 정면(center_m)이 가까우면 경고한다.
-         이때 좌우 포함 전체 검출 중 거리가 center_m과 비슷하거나 더 가까운 게
-         있으면 그 라벨을 빌려오고(예: "의자"), 거리는 검출과 depth 중
-         '더 가까운' 값을 쓴다. → 종류도 살리고, 더 급한 거리로 안내.
-         비슷한 검출이 없으면 "장애물"(미확인) + center_m 으로 안내한다.
-         (모델이 모르는 기둥·박스·벽 모서리 등도 놓치지 않음)
+      2) 정면 검출은 없지만 depth상 정면(center_m)이 가까우면 경고(라벨/거리 보강).
       3) 정면에 검출도 없고 depth도 충분히 멀면 None(조용).
-
-    center_m: 정면 depth 거리(m). None이거나 0이면 depth 판단 생략.
     """
     obstacles = obstacles or []
     front = [o for o in obstacles if o["direction"] == "정면"]
@@ -84,8 +92,6 @@ def pick_priority_obstacle(obstacles, center_m=None):
         if assess_safety(center_m) in ("stop", "warn"):
             label = "장애물"
             dist = center_m
-            # 좌우 포함 검출 중, 너무 가깝지(노이즈) 않으면서
-            # center_m 근처이거나 더 가까운 것 → 같은 물체로 보고 라벨 차용
             candidates = [
                 o for o in obstacles
                 if o["distance_m"] >= NEAR_NOISE_M
@@ -136,7 +142,6 @@ def main():
     speaker = Speaker(dry_run=dry_run)
 
     # 2-1) 점자블록 조회 버튼 (GPIO17). 누르면 현재 점자블록 상태를 안내.
-    #      노트북(--dry-run, gpiozero 없음)에서도 돌아가도록 ImportError를 흡수한다.
     button = None
     button_state = {"latest": None}   # 루프가 최신 점자블록 측정값을 넣어줌
     try:
@@ -166,14 +171,9 @@ def main():
             speaker.say("sys_start")
 
             # ── 장애물 안내 상태 ──
-            # 같은 상태 키가 유지되는 동안 stop은 N회까지, warn은 1회만 발화.
             current_obstacle_key = None
             obstacle_speak_count = 0      # 현재 키에서 발화한 횟수
-            last_obstacle_speak_time = 0.0
-
-            # ── 점자블록 상태 ──
-            # 자동 안내는 하지 않는다. 버튼을 누를 때만 안내하므로,
-            # 버튼 핸들러(다른 스레드)가 읽을 최신 측정값은 button_state에 보관한다.
+            last_obstacle_speak_time = 0.0   # 마지막으로 '실제 발화'한 시각
 
             # ── 좁은 통로 상태 ──
             in_narrow = False
@@ -200,15 +200,10 @@ def main():
                             info = [(o["label"], f"{o['distance_m']:.2f}m")
                                     for o in obstacles]
                             print(f"[디버그] 장애물 {info}")
-                        if tactile is not None:
-                            print(f"[디버그] 점자블록 {tactile}")
                         if clearance is not None:
                             print(f"[디버그] 통로 L{clearance['left_m']:.2f}/"
                                   f"C{clearance['center_m']:.2f}/"
                                   f"R{clearance['right_m']:.2f} → {situation}")
-
-                    # 점자블록은 자동 안내하지 않는다. 버튼을 누를 때만 안내한다.
-                    # (버튼 핸들러가 button_state["latest"]를 읽어 build_tactile_query_guidance 호출)
 
                     # ─────────────────────────────────────────────────
                     # 좁은 통로 상태 확정 + 이벤트 판정
@@ -231,8 +226,10 @@ def main():
                         in_narrow = False
 
                     # ─────────────────────────────────────────────────
-                    # (1) 장애물 안내 — depth 우선 + 검출 라벨 보강
-                    #     검출 물체가 없어도 정면 depth가 가까우면 "장애물"로 안내
+                    # (1) 장애물 안내
+                    #     - 상태가 바뀌면 즉시 안내(쿨다운 무시).
+                    #     - 같은 상태가 유지되면 STOP/WARN_SPEAK_COOLDOWN 간격을
+                    #       둬서 매 프레임 폭주하지 않게 한다.
                     # ─────────────────────────────────────────────────
                     center_m = clearance["center_m"] if clearance else None
                     target = pick_priority_obstacle(obstacles, center_m=center_m)
@@ -252,53 +249,49 @@ def main():
                         obstacle_speak_count = 0
                     else:
                         safety = new_key[3]   # "stop" | "warn" | "ok"
+                        key_changed = (new_key != current_obstacle_key)
 
-                        if new_key != current_obstacle_key:
+                        if key_changed:
                             # 상태 변화 → 새 이벤트
                             current_obstacle_key = new_key
                             obstacle_speak_count = 0
 
                         if safety == "ok":
-                            # 안전 등급은 안내 안 함
-                            pass
+                            pass   # 안전 등급은 안내 안 함
                         else:
-                            # 발화 횟수 한도 체크
+                            now = time.time()
                             allowed = (STOP_MAX_REPEATS if safety == "stop" else 1)
-                            if obstacle_speak_count < allowed:
-                                # stop의 두 번째 발화는 최소 간격 둔다
-                                now = time.time()
-                                can_speak = True
-                                if (safety == "stop"
-                                        and obstacle_speak_count >= 1
-                                        and now - last_obstacle_speak_time
-                                            < STOP_REPEAT_INTERVAL):
-                                    can_speak = False
+                            cooldown = (STOP_SPEAK_COOLDOWN if safety == "stop"
+                                        else WARN_SPEAK_COOLDOWN)
+                            elapsed = now - last_obstacle_speak_time
 
-                                # stop은 진행 중 안내를 끊고 끼어들 수 있어야 하므로
-                                # is_speaking 가드를 적용하지 않는다(인터럽트).
-                                # warn 등 일반 안내만 재생 중이면 양보.
-                                gate_ok = (safety == "stop") or (not speaker.is_speaking())
-                                if can_speak and gate_ok:
-                                    guidance = build_guidance(target, stride_m,
-                                                              avoid_situation=avoid_sit)
-                                    chunks, text = guidance
-                                    if chunks is not None:
-                                        if safety == "stop":
-                                            speaker.say_now(guidance)   # 인터럽트
-                                        else:
-                                            speaker.say(guidance)
-                                        obstacle_speak_count += 1
-                                        last_obstacle_speak_time = now
-                                        obstacle_announced_this_frame = True
+                            # 발화 조건:
+                            #   · 상태가 막 바뀌었으면(key_changed) 즉시 1회 허용.
+                            #   · 같은 상태면 발화 횟수가 한도 미만 + 쿨다운 경과.
+                            can_speak = False
+                            if key_changed:
+                                can_speak = True
+                            elif (obstacle_speak_count < allowed
+                                  and elapsed >= cooldown):
+                                can_speak = True
+
+                            if can_speak:
+                                guidance = build_guidance(
+                                    target, stride_m, avoid_situation=avoid_sit)
+                                chunks, text = guidance
+                                if chunks is not None:
+                                    speaker.say(guidance)
+                                    obstacle_speak_count += 1
+                                    last_obstacle_speak_time = now
+                                    obstacle_announced_this_frame = True
 
                     # ─────────────────────────────────────────────────
-                    # (2) 점자블록 안내 — 자동 안내 없음. 버튼(GPIO17)을 누르면
-                    #     on_button_press()가 button_state["latest"]를 읽어 안내한다.
+                    # (2) 점자블록 안내 — 버튼(GPIO17)을 누를 때만.
                     # ─────────────────────────────────────────────────
 
                     # ─────────────────────────────────────────────────
                     # (3) 좁은 통로 진입 안내
-                    #     위급 장애물이 이번 프레임에 안내됐다면 보류
+                    #     위급 장애물이 이번 프레임에 안내됐거나 재생 중이면 보류
                     # ─────────────────────────────────────────────────
                     if (narrow_event == "enter"
                             and not obstacle_announced_this_frame
