@@ -44,6 +44,7 @@ from step_converter import (
     get_front_half_width,
     build_guidance,
     build_narrow_corridor_guidance,
+    build_dropoff_guidance,
     build_tactile_query_guidance,
     distance_to_steps,
     assess_safety,
@@ -71,6 +72,13 @@ TACTILE_LEAVING_STEPS = 4
 # 깜빡임 방지(hysteresis): 연속 N프레임 같은 상태가 잡혀야 확정
 TACTILE_CONFIRM_FRAMES = 3
 NARROW_CONFIRM_FRAMES = 3
+
+# 단차(계단/drop-off) 안내 정책
+#   · 연속 N프레임 같은 상태일 때만 확정(노이즈로 인한 헛경고 방지).
+#   · 위험 상태(down/up)로 새로 진입하면 즉시 1회 안내.
+#   · 같은 위험 상태가 계속되면 쿨다운 간격마다 한 번씩 환기(낙상 위험이라 반복 알림).
+DROPOFF_CONFIRM_FRAMES = 3
+DROPOFF_SPEAK_COOLDOWN = 2.0
 
 # depth로 미확인 장애물을 안내할 때, 근처 검출 물체의 라벨을 빌려오는 기준
 NEAR_NOISE_M = 0.4            # 이보다 가까운 검출 거리는 측정 신뢰도 낮음 → 라벨 후보 제외
@@ -189,6 +197,11 @@ def main():
             narrow_raw_streak_in = 0
             narrow_raw_streak_out = 0
 
+            # ── 단차(계단/drop-off) 상태 ──
+            dropoff_status = "flat"                       # 확정된 현재 단차 상태
+            dropoff_raw_streak = {"flat": 0, "down": 0, "up": 0}
+            last_dropoff_speak_time = 0.0
+
             try:
                 while True:
                     obstacles = reader.get_obstacles(
@@ -200,6 +213,7 @@ def main():
                     tactile = reader.detect_tactile_paving()
                     situation, clearance = reader.get_open_direction(
                         narrow_side_m=narrow_threshold)
+                    dropoff = reader.detect_dropoff()
 
                     # 버튼 핸들러(다른 스레드)가 읽을 최신 점자블록 상태 보관
                     button_state["latest"] = tactile
@@ -213,6 +227,13 @@ def main():
                             print(f"[디버그] 통로 L{clearance['left_m']:.2f}/"
                                   f"C{clearance['center_m']:.2f}/"
                                   f"R{clearance['right_m']:.2f} → {situation}")
+                        if dropoff is not None:
+                            fm = dropoff["floor_m"]
+                            bm = dropoff["baseline_m"]
+                            print(f"[디버그] 단차 {dropoff['status']:4} "
+                                  f"floor={fm if fm is None else round(fm,2)} "
+                                  f"base={bm if bm is None else round(bm,2)} "
+                                  f"valid={dropoff['valid_ratio']:.2f}")
 
                     # ─────────────────────────────────────────────────
                     # 좁은 통로 상태 확정 + 이벤트 판정
@@ -295,15 +316,51 @@ def main():
                                     obstacle_announced_this_frame = True
 
                     # ─────────────────────────────────────────────────
+                    # (1.5) 단차(계단/drop-off) 안내
+                    #     내려가는 단차는 낙상 위험이라 자동 안내(버튼 불필요).
+                    #     연속 N프레임 확정 후, 위험 상태로 새로 진입하면 즉시 1회,
+                    #     같은 위험 상태가 지속되면 쿨다운 간격마다 환기.
+                    # ─────────────────────────────────────────────────
+                    dropoff_announced_this_frame = False
+                    if dropoff is not None:
+                        raw = dropoff["status"]            # "flat" | "down" | "up"
+                        for k in dropoff_raw_streak:
+                            dropoff_raw_streak[k] = (
+                                dropoff_raw_streak[k] + 1 if k == raw else 0)
+                        confirmed = (dropoff_raw_streak[raw]
+                                     >= DROPOFF_CONFIRM_FRAMES)
+
+                        speak_dropoff = False
+                        if confirmed and raw != dropoff_status:
+                            # 상태가 새로 확정됨 (예: flat → down)
+                            dropoff_status = raw
+                            if dropoff_status in ("down", "up"):
+                                speak_dropoff = True
+                        elif (confirmed and raw == dropoff_status
+                              and dropoff_status in ("down", "up")
+                              and (time.time() - last_dropoff_speak_time
+                                   >= DROPOFF_SPEAK_COOLDOWN)):
+                            # 같은 위험 상태 지속 → 쿨다운마다 환기
+                            speak_dropoff = True
+
+                        if speak_dropoff:
+                            g = build_dropoff_guidance(dropoff_status)
+                            if g[0] is not None:
+                                speaker.say(g)
+                                last_dropoff_speak_time = time.time()
+                                dropoff_announced_this_frame = True
+
+                    # ─────────────────────────────────────────────────
                     # (2) 점자블록 안내 — 버튼(GPIO17)을 누를 때만.
                     # ─────────────────────────────────────────────────
 
                     # ─────────────────────────────────────────────────
                     # (3) 좁은 통로 진입 안내
-                    #     위급 장애물이 이번 프레임에 안내됐거나 재생 중이면 보류
+                    #     위급 장애물·단차가 이번 프레임에 안내됐거나 재생 중이면 보류
                     # ─────────────────────────────────────────────────
                     if (narrow_event == "enter"
                             and not obstacle_announced_this_frame
+                            and not dropoff_announced_this_frame
                             and not speaker.is_speaking()):
                         speaker.say(build_narrow_corridor_guidance())
 

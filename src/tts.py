@@ -59,6 +59,8 @@ _CHUNK_KO = {
     "avoid_both": "양옆으로 피할 수 있음.",
     "tactile": "점자블록.", "tactile_leaving": "점자블록 곧 벗어남.",
     "tactile_none": "주변에 점자블록이 없습니다.",
+    "step_down": "주의, 앞에 내려가는 계단.",
+    "step_up": "주의, 앞에 올라가는 계단.",
     "sys_start": "안내를 시작합니다.", "sys_end": "안내를 종료합니다.",
 }
 

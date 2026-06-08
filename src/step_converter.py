@@ -273,6 +273,19 @@ def build_narrow_corridor_guidance():
     return ["narrow"], "좁은 통로, 주의하세요."
 
 
+def build_dropoff_guidance(status):
+    """단차(계단) 안내. → (chunks, text). 안내할 게 없으면 (None, None).
+
+    status: "down" = 내려가는 계단(메인 기능),
+            "up"   = 올라가는 계단(ENABLE_STEP_UP일 때만 들어옴, 실험용).
+    """
+    if status == "down":
+        return ["step_down"], "주의, 앞에 내려가는 계단."
+    elif status == "up":
+        return ["step_up"], "주의, 앞에 올라가는 계단."
+    return None, None
+
+
 def build_tactile_appear_guidance(clock_direction, distance_m, stride_m):
     """점자블록 출현 안내. → (chunks, text)"""
     clock_chunk = CLOCK_TO_CHUNK.get(clock_direction)

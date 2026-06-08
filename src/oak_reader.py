@@ -77,6 +77,31 @@ SIDE_DIFF_THRESHOLD_M = 1.0
 NARROW_SIDE_DEFAULT_M = 1.2
 NARROW_FRONT_MARGIN_M = 0.4
 
+# ── 단차(계단/drop-off) 감지 기준 ─────────────────────
+#   [원리] 카메라가 가슴 정면(약 1.3m, 틸트 0°)이면 바닥은 화면 '맨 아래 띠'에만
+#     잡힌다(수직화각 약 56° → 화면 최하단이 약 2.4m 앞 바닥). 그 바닥이
+#       (a) 기준 바닥거리보다 갑자기 멀어지거나(거리↑)  → 내려가는 단차(drop-off)
+#       (b) 아예 사라지면(유효픽셀↓, 낭떠러지)          → 내려가는 단차
+#     로 판단한다. 무거운 평면추정(RANSAC) 없이 ROI 한 곳 통계만 보므로 라파 부하가 가볍다.
+#
+#   [가슴 정면의 한계 — 실험 시 인지할 것]
+#     · 발 앞 1~2m 가까운 단차는 화면 밖이라 못 잡는다(약 2.4m 이상만 보임).
+#     · 올라가는 계단은 '바닥이 가까워짐'이라 정면 벽/장애물과 depth상 구분이 약하다.
+#       → 오경보가 많아 ENABLE_STEP_UP을 기본 False로 둔다(실험으로 임계 잡은 뒤 켤 것).
+#
+#   [튜닝 포인트] 아래 상수들을 실제 환경(바닥 재질/조명/카메라 높이)에서 조정.
+ENABLE_STEP_UP = False           # 올라가는 계단 감지(실험용). 가슴정면에선 오경보 많아 기본 OFF.
+DROPOFF_ROI_Y_START = 0.80       # 바닥 ROI: 화면 세로 이 비율부터 (장애물 band 0.2~0.8과 안 겹침)
+DROPOFF_ROI_Y_END   = 0.98       # 맨 끝 2%는 렌즈 왜곡/노이즈라 제외
+DROPOFF_ROI_X_LO    = 0.34       # 바닥 ROI 가로 시작(중앙 1/3 = 정면 발 앞)
+DROPOFF_ROI_X_HI    = 0.66       # 바닥 ROI 가로 끝
+DROPOFF_MIN_VALID_RATIO = 0.30   # 바닥 ROI 유효픽셀 비율이 이 미만이면 '바닥 사라짐'(=내려감)
+DROPOFF_FAR_MARGIN_M    = 1.2    # 바닥이 기준보다 이만큼(m) 멀어지면 '내려가는 단차'
+STEPUP_NEAR_MARGIN_M    = 0.8    # (실험) 바닥이 기준보다 이만큼(m) 가까워지면 '올라가는 단차'
+FLOOR_BASELINE_WINDOW   = 30     # 기준 바닥거리 이동평균 프레임 수 (20fps ≈ 1.5초)
+FLOOR_BASELINE_MIN_M    = 1.0    # 기준 바닥거리로 학습할 유효 범위(이 밖의 값은 학습서 제외)
+FLOOR_BASELINE_MAX_M    = 5.0
+
 # ── 점자블록(노란색) 색 검출 기준 ─────────────────────
 #   채도(S) 하한을 높여 아이보리/베이지(연한 저채도) 오검출을 줄인다.
 #   실제 점자블록은 채도 높은 '쨍한 노랑'이라 살아남고,
@@ -198,6 +223,8 @@ class OakReader:
             "right":  deque(maxlen=SMOOTHING_WINDOW),
         }
         self._situation_hist = deque(maxlen=SMOOTHING_WINDOW)
+        # 단차 감지용: 평지일 때의 바닥거리(m)를 모아 '기준 바닥거리'로 학습
+        self._floor_hist = deque(maxlen=FLOOR_BASELINE_WINDOW)
 
     def __enter__(self):
         self.device = dai.Device(self.pipeline, maxUsbSpeed=dai.UsbSpeed.HIGH)
@@ -459,3 +486,65 @@ class OakReader:
                 "distance_m": distance_m,
                 "far_end_distance_m": far_end_distance_m,
                 "ratio": ratio}
+
+    def detect_dropoff(self):
+        """화면 하단 '바닥 ROI'의 depth로 내려가는/올라가는 단차를 감지.
+
+        [원리] (가슴 정면 카메라 기준)
+          - 평지를 걸을 땐 바닥 ROI에 일정 거리의 바닥이 꾸준히 잡힌다.
+            그 거리를 이동평균으로 모아 '기준 바닥거리(baseline)'로 계속 학습한다.
+          - 내려가는 단차(drop-off): 바닥이 baseline보다 갑자기 멀어지거나(거리↑),
+            아예 사라진다(유효픽셀 비율↓). 둘 다 '내려감'으로 본다.
+          - 올라가는 단차: 바닥이 baseline보다 갑자기 가까워진다(거리↓).
+            (ENABLE_STEP_UP=True 일 때만. 정면 벽/장애물과 헷갈려 오경보 많음.)
+
+        반환: {
+          "status": "flat" | "down" | "up",
+          "floor_m": float or None,     # 이번 프레임 바닥 대표거리(사라졌으면 None)
+          "baseline_m": float or None,  # 현재까지 학습된 기준 바닥거리
+          "valid_ratio": float,         # 바닥 ROI 유효픽셀 비율(디버그용)
+        }
+        depth가 아직 없으면 None.
+
+        [주의] 위험 상태(down/up)로 판단된 프레임은 baseline 학습에서 제외해
+        기준선이 오염되지 않게 한다. 깜빡임 안정화(연속 N프레임 확정)는 main에서 처리.
+        """
+        self._update_depth()
+        if self._latest_depth is None:
+            return None
+
+        depth = self._latest_depth
+        h, w = depth.shape
+        y0 = int(h * DROPOFF_ROI_Y_START)
+        y1 = int(h * DROPOFF_ROI_Y_END)
+        x0 = int(w * DROPOFF_ROI_X_LO)
+        x1 = int(w * DROPOFF_ROI_X_HI)
+        roi = depth[y0:y1, x0:x1]
+
+        valid = roi[(roi > 300) & (roi < 10000)]
+        valid_ratio = (valid.size / roi.size) if roi.size else 0.0
+
+        baseline = (sum(self._floor_hist) / len(self._floor_hist)
+                    if self._floor_hist else None)
+
+        # (a) 바닥이 거의 안 잡힘 = 바닥이 사라짐 → 내려가는 단차(낭떠러지)
+        #     baseline은 갱신하지 않는다(오염 방지).
+        if valid_ratio < DROPOFF_MIN_VALID_RATIO:
+            return {"status": "down", "floor_m": None,
+                    "baseline_m": baseline, "valid_ratio": valid_ratio}
+
+        floor_m = float(np.percentile(valid, 50)) / 1000.0   # 바닥 대표거리(중앙값)
+
+        status = "flat"
+        if baseline is not None:
+            if floor_m >= baseline + DROPOFF_FAR_MARGIN_M:
+                status = "down"                               # (b) 바닥이 멀어짐
+            elif ENABLE_STEP_UP and floor_m <= baseline - STEPUP_NEAR_MARGIN_M:
+                status = "up"                                 # 바닥이 가까워짐(실험)
+
+        # 평지로 보일 때만, 합리적 범위 안의 값만 기준선으로 학습
+        if status == "flat" and FLOOR_BASELINE_MIN_M <= floor_m <= FLOOR_BASELINE_MAX_M:
+            self._floor_hist.append(floor_m)
+
+        return {"status": status, "floor_m": floor_m,
+                "baseline_m": baseline, "valid_ratio": valid_ratio}
