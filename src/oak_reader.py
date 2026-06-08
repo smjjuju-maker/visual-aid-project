@@ -112,6 +112,20 @@ YELLOW_HSV_UPPER = np.array([35, 255, 255])
 TACTILE_RATIO_THRESHOLD = 0.05          # 화면 하단 ROI 중 노란 픽셀 비율
 TACTILE_ROI_Y_START_RATIO = 0.5         # ROI: 화면 세로 아래쪽 절반
 
+# ── 횡단보도(흰-검 줄무늬) 검출 기준 ─────────────────
+#   [원리] 횡단보도는 밝은 줄(흰 페인트)과 어두운 줄(노면)이 일정 간격으로 반복된다.
+#     화면 하단 ROI를 그레이스케일로 보고 '행(가로줄)별 평균 밝기' 1D 프로파일을 만든 뒤,
+#     장면 평균을 기준으로 밝음/어두움 이진화 → 밝다↔어둡다 '전환 횟수'를 센다.
+#     전환이 충분히 많고(여러 줄) 명암 대비가 크면 횡단보도로 판정한다.
+#     (절대 밝기가 아니라 그 장면의 평균 기준이라 조명이 달라도 비교적 강건하다)
+#   [점자블록 제외] 노란 점자블록 픽셀은 빼고 본다(흰 줄과 헷갈리지 않게).
+#   [한계] 가슴 정면 카메라라 바닥이 화면 하단에만 잡힌다. 흰 벽+그림자, 타일,
+#     햇빛 반사 등은 오검출될 수 있어 실제 횡단보도 데이터로 임계값 튜닝이 필요하다.
+CROSSWALK_ROI_Y_START_RATIO = 0.5       # 점자블록과 동일하게 화면 하단 절반을 본다
+CROSSWALK_SMOOTH_K = 5                   # 행별 밝기 프로파일 스무딩 커널(작은 노이즈 제거)
+CROSSWALK_MIN_TRANSITIONS = 6            # 밝다↔어둡다 전환 횟수 임계(흰-검 약 3쌍 이상)
+CROSSWALK_MIN_CONTRAST = 40.0            # 밝은행-어두운행 밝기차(0~255). 균일 바닥 오검출 방지
+
 
 def create_pipeline():
     """AI Spatial Detection 파이프라인 생성. RGB preview도 외부로 출력."""
@@ -548,3 +562,83 @@ class OakReader:
 
         return {"status": status, "floor_m": floor_m,
                 "baseline_m": baseline, "valid_ratio": valid_ratio}
+
+    def detect_crosswalk(self):
+        """화면 하단 ROI에서 흰-검 줄무늬 주기 패턴으로 횡단보도를 검출.
+
+        [원리]
+          횡단보도는 밝은 줄(흰 페인트)과 어두운 줄(노면)이 일정 간격으로 반복된다.
+          하단 ROI를 그레이스케일로 보고 '행(가로줄)별 평균 밝기' 1D 프로파일을 만든 뒤,
+          그 장면의 평균 밝기를 기준으로 밝음/어두움을 이진화하고
+          '밝다↔어둡다 전환 횟수'를 센다. 전환이 충분히 많고(여러 줄) 명암 대비가
+          크면 횡단보도로 판정한다. 노란(점자블록) 픽셀은 제외한다.
+
+        반환: {
+          "present": bool,                 # 횡단보도 존재 여부
+          "clock_direction": "11시" 등 or None,  # 흰 줄 무게중심의 시계 방향
+          "distance_m": float or None,     # 무게중심까지 거리(m)
+          "transitions": int,              # 밝다↔어둡다 전환 횟수(디버그용)
+          "contrast": float,               # 밝은행-어두운행 밝기차(디버그용)
+        }
+        RGB가 아직 없으면 None.
+        """
+        self._update_rgb()
+        self._update_depth()
+        if self._latest_rgb is None:
+            return None
+
+        frame = self._latest_rgb
+        h, w = frame.shape[:2]
+        y_start = int(h * CROSSWALK_ROI_Y_START_RATIO)
+        roi = frame[y_start:, :]
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+        # 노란(점자블록) 픽셀은 제외 → 흰 줄과 헷갈리지 않게 NaN 처리
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        yellow = cv2.inRange(hsv, YELLOW_HSV_LOWER, YELLOW_HSV_UPPER) > 0
+        gray[yellow] = np.nan
+
+        # 행(가로줄)별 평균 밝기 프로파일 (노랑 제외). 전부 NaN인 행은 무시.
+        with np.errstate(invalid="ignore"):
+            row_mean = np.nanmean(gray, axis=1)
+        valid = ~np.isnan(row_mean)
+        none_result = {"present": False, "clock_direction": None,
+                       "distance_m": None, "transitions": 0, "contrast": 0.0}
+        if int(valid.sum()) < 10:
+            return none_result
+        prof = row_mean[valid]
+
+        # 작은 노이즈 완화를 위한 이동평균 스무딩
+        k = CROSSWALK_SMOOTH_K
+        if prof.size >= k:
+            prof = np.convolve(prof, np.ones(k) / k, mode="same")
+
+        contrast = float(prof.max() - prof.min())
+        thr = float(prof.mean())
+        binary = prof > thr
+        transitions = int(np.count_nonzero(binary[1:] != binary[:-1]))
+
+        present = (transitions >= CROSSWALK_MIN_TRANSITIONS
+                   and contrast >= CROSSWALK_MIN_CONTRAST)
+        if not present:
+            return {"present": False, "clock_direction": None,
+                    "distance_m": None, "transitions": transitions,
+                    "contrast": contrast}
+
+        # 방향: 밝은(흰 줄) 픽셀들의 가로 무게중심 → 시계 방향
+        bright_thr = thr + contrast * 0.25
+        gray0 = np.nan_to_num(gray, nan=0.0)   # 노랑(NaN)은 0 → bright_thr 미만이라 제외됨
+        ys, xs = np.where(gray0 > bright_thr)
+        if xs.size == 0:
+            cx = w / 2.0
+            cy_full = y_start + roi.shape[0] / 2.0
+        else:
+            cx = float(xs.mean())
+            cy_full = float(ys.mean()) + y_start
+        clock = describe_clock_direction(cx / w)
+        distance_m = self._depth_at(cx, cy_full, h, w)
+
+        return {"present": True, "clock_direction": clock,
+                "distance_m": distance_m, "transitions": transitions,
+                "contrast": contrast}

@@ -319,6 +319,43 @@ def build_tactile_query_guidance(tactile, stride_m):
     )
 
 
+def build_crosswalk_appear_guidance(clock_direction):
+    """횡단보도 출현 안내. → (chunks, text)
+       거리는 흰 줄 무게중심 기준이라 부정확할 수 있어 방향만 안내한다.
+    """
+    clock_chunk = CLOCK_TO_CHUNK.get(clock_direction)
+    chunks = ([clock_chunk] if clock_chunk else []) + ["crosswalk"]
+    return chunks, f"{clock_direction} 방향에 횡단보도."
+
+
+def build_environment_query_guidance(tactile, crosswalk, stride_m):
+    """버튼을 눌렀을 때 점자블록 + 횡단보도 상태를 모두 안내. → (chunks, text)
+
+    [정책]
+      · 둘 다 잡히면 점자블록 → 횡단보도 순서로 둘 다 안내.
+        예) "1시 방향 세 걸음 앞에 점자블록. 11시 방향에 횡단보도."
+      · 하나만 잡히면 그것만 안내.
+      · 둘 다 없으면 "주변에 점자블록이나 횡단보도가 없습니다."
+    """
+    chunks = []
+    texts = []
+
+    if tactile is not None and tactile.get("present"):
+        c, t = build_tactile_appear_guidance(
+            tactile.get("clock_direction"), tactile.get("distance_m"), stride_m)
+        chunks += c
+        texts.append(t)
+
+    if crosswalk is not None and crosswalk.get("present"):
+        c, t = build_crosswalk_appear_guidance(crosswalk.get("clock_direction"))
+        chunks += c
+        texts.append(t)
+
+    if not chunks:
+        return ["env_none"], "주변에 점자블록이나 횡단보도가 없습니다."
+    return chunks, " ".join(texts)
+
+
 def build_tactile_disappear_guidance():
     """점자블록이 사라졌을 때 안내. (현재 미사용) → (chunks, text)"""
     return ["tactile_leaving"], "점자블록 벗어남."

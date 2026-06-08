@@ -46,6 +46,7 @@ from step_converter import (
     build_narrow_corridor_guidance,
     build_dropoff_guidance,
     build_tactile_query_guidance,
+    build_environment_query_guidance,
     distance_to_steps,
     assess_safety,
 )
@@ -158,20 +159,20 @@ def main():
     # 2) 음성 엔진
     speaker = Speaker(dry_run=dry_run)
 
-    # 2-1) 점자블록 조회 버튼 (GPIO17). 누르면 현재 점자블록 상태를 안내.
+    # 2-1) 환경 조회 버튼 (GPIO17). 누르면 현재 점자블록 + 횡단보도 상태를 안내.
     button = None
-    button_state = {"latest": None}   # 루프가 최신 점자블록 측정값을 넣어줌
+    button_state = {"tactile": None, "crosswalk": None}   # 루프가 최신 측정값을 넣어줌
     try:
         from gpiozero import Button
         button = Button(17, pull_up=True, bounce_time=0.05)
 
         def on_button_press():
-            guidance = build_tactile_query_guidance(
-                button_state["latest"], stride_m)
+            guidance = build_environment_query_guidance(
+                button_state["tactile"], button_state["crosswalk"], stride_m)
             speaker.say_now(guidance)   # 버튼 응답은 즉시(인터럽트)
 
         button.when_pressed = on_button_press
-        print("[버튼] 점자블록 조회 버튼 준비 완료 (GPIO17)")
+        print("[버튼] 환경 조회 버튼 준비 완료 (GPIO17) — 점자블록 + 횡단보도")
     except ImportError:
         print("[버튼] gpiozero 없음 → 버튼 비활성화 (노트북 테스트 모드)")
     except Exception as e:
@@ -214,9 +215,11 @@ def main():
                     situation, clearance = reader.get_open_direction(
                         narrow_side_m=narrow_threshold)
                     dropoff = reader.detect_dropoff()
+                    crosswalk = reader.detect_crosswalk()
 
-                    # 버튼 핸들러(다른 스레드)가 읽을 최신 점자블록 상태 보관
-                    button_state["latest"] = tactile
+                    # 버튼 핸들러(다른 스레드)가 읽을 최신 점자블록·횡단보도 상태 보관
+                    button_state["tactile"] = tactile
+                    button_state["crosswalk"] = crosswalk
 
                     if debug:
                         if obstacles:
