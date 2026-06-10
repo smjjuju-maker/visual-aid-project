@@ -25,6 +25,10 @@ import tempfile
 OUT_FILE = "flow_demo.mp3"
 BITRATE = "192k"          # 음질(높일수록 큼). 128k~256k 권장.
 
+# 맨 앞 무음(초): 블루투스 이어폰이 깨어나기 전에 첫 음절이 잘리는 걸 막는다.
+# 첫 단어가 여전히 끊기면 1.5~2.0 으로 늘린다.
+LEAD_IN_SILENCE_SEC = 1.0
+
 # 버튼(=Enter)을 누른 뒤 나오던 마지막 안내를, 단일 mp3에서는 시간 간격으로 처리.
 BUTTON_GAP_SEC = 3.0      # 마지막 안내 전 무음(초). 원하는 만큼 조절.
 
@@ -54,7 +58,8 @@ def main():
         sys.exit(1)
 
     tmp = tempfile.mkdtemp()
-    combined = AudioSegment.silent(duration=0)
+    # 맨 앞 무음으로 시작 → 블루투스 워밍업(첫 음절 끊김 방지)
+    combined = AudioSegment.silent(duration=int(LEAD_IN_SILENCE_SEC * 1000))
 
     for i, (gap, text) in enumerate(FLOW, start=1):
         if gap > 0:
