@@ -542,8 +542,13 @@ class OakReader:
                     if self._floor_hist else None)
 
         # (a) 바닥이 거의 안 잡힘 = 바닥이 사라짐 → 내려가는 단차(낭떠러지)
+        #     단, 기준 바닥(baseline)이 아직 학습되기 전(시작 직후)에는 판단하지 않는다.
+        #     → 시작하자마자 헛경고("내려가는 단차")가 한 번 나가는 것을 방지.
         #     baseline은 갱신하지 않는다(오염 방지).
         if valid_ratio < DROPOFF_MIN_VALID_RATIO:
+            if baseline is None:
+                return {"status": "flat", "floor_m": None,
+                        "baseline_m": None, "valid_ratio": valid_ratio}
             return {"status": "down", "floor_m": None,
                     "baseline_m": baseline, "valid_ratio": valid_ratio}
 
