@@ -67,6 +67,13 @@ STOP_REPEAT_INTERVAL = 1.0    # stop 두 번 발화 사이 최소 간격(초)
 STOP_SPEAK_COOLDOWN = 5.0     # 같은 정지 상황 반복 안내 최소 간격(초)
 WARN_SPEAK_COOLDOWN = 10.0     # 같은 주의 상황 반복 안내 최소 간격(초)
 
+# ── 전체 최소 간격(떨림으로 인한 폭주 방지) ────────────
+#   라벨/방향/회피가 깜빡이면 '상태 키'가 매번 바뀐 걸로 보여 쿨다운을
+#   건너뛰고 안내가 쏟아진다. 그래서 키가 바뀌어도 마지막 발화로부터
+#   아래 간격 안에는 새 안내를 내보내지 않는다(= 모든 장애물 안내의 하한선).
+#   단, warn→stop으로 '승격'될 때는 위급하므로 이 간격을 무시하고 즉시 안내.
+OBSTACLE_MIN_INTERVAL = 3.0   # 키가 바뀌어도 지켜야 할 장애물 안내 최소 간격(초)
+
 # 점자블록 "곧 벗어남" 판정: 노란 영역의 먼 끝이 이 걸음수 이내면 발화
 TACTILE_LEAVING_STEPS = 4
 
@@ -78,6 +85,7 @@ NARROW_CONFIRM_FRAMES = 3
 #   · 연속 N프레임 같은 상태일 때만 확정(노이즈로 인한 헛경고 방지).
 #   · 위험 상태(down/up)로 새로 진입하면 즉시 1회 안내.
 #   · 같은 위험 상태가 계속되면 쿨다운 간격마다 한 번씩 환기(낙상 위험이라 반복 알림).
+ENABLE_DROPOFF = True         # 단차 기능 ON/OFF 스위치. False면 단차 감지·안내 전체 비활성
 DROPOFF_CONFIRM_FRAMES = 3
 DROPOFF_SPEAK_COOLDOWN = 2.0
 
@@ -214,7 +222,7 @@ def main():
                     tactile = reader.detect_tactile_paving()
                     situation, clearance = reader.get_open_direction(
                         narrow_side_m=narrow_threshold)
-                    dropoff = reader.detect_dropoff()
+                    dropoff = reader.detect_dropoff() if ENABLE_DROPOFF else None
                     crosswalk = reader.detect_crosswalk()
 
                     # 버튼 핸들러(다른 스레드)가 읽을 최신 점자블록·횡단보도 상태 보관
@@ -282,7 +290,13 @@ def main():
                         obstacle_speak_count = 0
                     else:
                         safety = new_key[2]   # "stop" | "warn" | "ok"
+                        prev_safety = (current_obstacle_key[2]
+                                       if current_obstacle_key is not None
+                                       else None)
                         key_changed = (new_key != current_obstacle_key)
+                        # warn(또는 없음) → stop 으로 위급해진 경우만 '승격'
+                        escalated_to_stop = (safety == "stop"
+                                             and prev_safety != "stop")
 
                         if key_changed:
                             # 상태 변화 → 새 이벤트
@@ -299,11 +313,14 @@ def main():
                             elapsed = now - last_obstacle_speak_time
 
                             # 발화 조건:
-                            #   · 상태가 막 바뀌었으면(key_changed) 즉시 1회 허용.
+                            #   · 위급 승격(→stop)이면 간격 무시하고 즉시 안내.
+                            #   · 상태가 바뀌었어도 최소 간격은 지킨다(떨림 폭주 방지).
                             #   · 같은 상태면 발화 횟수 한도 미만 + 쿨다운 경과.
                             can_speak = False
-                            if key_changed:
+                            if escalated_to_stop:
                                 can_speak = True
+                            elif key_changed:
+                                can_speak = (elapsed >= OBSTACLE_MIN_INTERVAL)
                             elif (obstacle_speak_count < allowed
                                   and elapsed >= cooldown):
                                 can_speak = True
