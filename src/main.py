@@ -213,6 +213,7 @@ def main():
             in_narrow = False
             narrow_raw_streak_in = 0
             narrow_raw_streak_out = 0
+            narrow_pending = False        # 진입 안내 대기(충돌로 못 나갔으면 계속 재시도)
 
             # ── 단차(계단/drop-off) 상태 ──
             dropoff_status = "flat"                       # 확정된 현재 단차 상태
@@ -270,9 +271,11 @@ def main():
                             and narrow_raw_streak_in >= NARROW_CONFIRM_FRAMES):
                         in_narrow = True
                         narrow_event = "enter"
+                        narrow_pending = True   # 진입 안내 예약(나갈 때까지 재시도)
                     elif (in_narrow
                           and narrow_raw_streak_out >= NARROW_CONFIRM_FRAMES):
                         in_narrow = False
+                        narrow_pending = False  # 통로를 벗어남 → 대기 취소
 
                     # ─────────────────────────────────────────────────
                     # (1) 장애물 안내
@@ -401,13 +404,16 @@ def main():
 
                     # ─────────────────────────────────────────────────
                     # (3) 좁은 통로 진입 안내
-                    #     위급 장애물·단차가 이번 프레임에 안내됐거나 재생 중이면 보류
+                    #     진입 시 예약(narrow_pending)해두고, 위급 장애물·단차가
+                    #     그 프레임에 안내됐거나 재생 중이면 보류 → 다음 프레임에 재시도.
+                    #     성공하면 예약 해제. (한 번 충돌로 영영 삼켜지던 문제 해결)
                     # ─────────────────────────────────────────────────
-                    if (narrow_event == "enter"
+                    if (narrow_pending
                             and not obstacle_announced_this_frame
                             and not dropoff_announced_this_frame
                             and not speaker.is_speaking()):
                         speaker.say(build_narrow_corridor_guidance())
+                        narrow_pending = False
 
             except KeyboardInterrupt:
                 print("\n[종료] 사용자 종료")
