@@ -1,73 +1,76 @@
 #!/usr/bin/env python3
 """
-tts_flow_test.py
-----------------
-카메라/센서 없이, 미리 정해 둔 '흐름'을 시간 순서대로 실제 TTS(voices/*.mp3)로
-재생하는 데모/테스트 스크립트.
+gen_flow_mp3.py
+---------------
+데모용 '흐름' 전체를 하나의 mp3 파일로 만든다.
 
-안내 멘트는 새로 만들지 않고, 코드에서 쓰는 음성 조각(gen_voices.py 의
-VOICE_CHUNKS 키)을 그대로 이어 붙여 재생한다. → "멘트는 코드에 맞게".
+- 단어 조각을 잇는 대신, 문장을 통째로 gTTS로 생성해 음질이 자연스럽다.
+- 안내 사이의 (N초 후) 시간은 무음으로 정확히 삽입한다.
+- 전부 한 파일이라 블루투스가 사이사이 잠들어 앞 음절이 잘리는 문제가 없다.
+
+필요 패키지 / 도구 (노트북에서 한 번만):
+    pip install gTTS pydub
+    그리고 ffmpeg 가 PATH 에 있어야 한다. (이미 winget 으로 설치돼 있음)
+    ※ gTTS 는 인터넷이 필요하다(구글 TTS 호출).
 
 실행:
-  라파(실제 음성):   python src/tts_flow_test.py
-  노트북(소리 없이):  python src/tts_flow_test.py --dry-run
-  버튼 단계:          해당 차례가 되면 Enter 키를 누르면 '버튼 누름'으로 처리
-
-각 항목은 (앞 안내가 끝난 뒤 기다릴 초, [조각 키들], 화면표시 텍스트, 버튼대기?).
-앞 안내 재생이 '끝난 다음' 그 초만큼 기다렸다가 다음 안내를 낸다(겹치지 않음).
+    python src/gen_flow_mp3.py
+결과:
+    flow_demo.mp3  (이 파일을 재생/다운로드해서 데모에 사용)
 """
+import os
 import sys
-import time
+import tempfile
 
-from tts import Speaker
+OUT_FILE = "flow_demo.mp3"
+BITRATE = "192k"          # 음질(높일수록 큼). 128k~256k 권장.
 
-# ── 흐름 정의 (요청하신 시나리오) ─────────────────────
-SCENARIO = [
-    # gap(초), 조각 키들, 표시 텍스트, 버튼대기
-    (0.0, ["sys_start"],
-          "안내를 시작합니다.", False),
-    (2.0, ["grade_stop", "step_8", "ape", "obj_table"],
-          "정지. 여덟 걸음 앞에 식탁.", False),
-    (8.0, ["avoid_left"],
-          "왼쪽으로 이동.", False),
-    (2.0, ["narrow"],
-          "좁은 통로, 주의하세요.", False),
-    (9.0, ["grade_warn", "step_7", "ape", "obj_chair"],
-          "주의. 일곱 걸음 앞에 의자.", False),
-    (7.0, ["grade_stop"],
-          "정지.", False),
-    (0.0, ["crosswalk", "tactile_none"],
-          "횡단보도. 주변에 점자블록이 없습니다.", True),   # ← 버튼 누른 후
+# 버튼(=Enter)을 누른 뒤 나오던 마지막 안내를, 단일 mp3에서는 시간 간격으로 처리.
+BUTTON_GAP_SEC = 3.0      # 마지막 안내 전 무음(초). 원하는 만큼 조절.
+
+# ── 흐름 정의 ─────────────────────────────────────────
+# (앞에 둘 무음 초, 읽을 문장)
+FLOW = [
+    (0.0,            "안내를 시작합니다."),
+    (2.0,            "주의. 여덟 걸음 앞에 식탁. 왼쪽으로 이동 가능."),
+    (8.0,            "정지. 식탁. 왼쪽으로 이동."),
+    (2.0,            "좁은 통로, 주의하세요."),
+    (9.0,            "주의. 일곱 걸음 앞에 의자."),
+    (7.0,            "정지. 의자. 막다른 길."),
+    (BUTTON_GAP_SEC, "주변에 점자블록이나 횡단보도가 없습니다."),
 ]
 
 
-def speak_and_wait(speaker, chunks, text):
-    """한 안내를 재생하고 끝날 때까지 기다린다(다음 안내와 겹치지 않게)."""
-    speaker.say((chunks, text))
-    # say()는 비동기(별도 스레드). 재생이 끝날 때까지 대기.
-    # dry_run이면 is_speaking()이 계속 False라 즉시 통과(화면 출력만).
-    time.sleep(0.05)
-    while speaker.is_speaking():
-        time.sleep(0.05)
-
-
 def main():
-    dry_run = "--dry-run" in sys.argv
-    speaker = Speaker(dry_run=dry_run)
+    try:
+        from gtts import gTTS
+    except ImportError:
+        print("[오류] gTTS 가 없습니다.  pip install gTTS pydub")
+        sys.exit(1)
+    try:
+        from pydub import AudioSegment
+    except ImportError:
+        print("[오류] pydub 가 없습니다.  pip install gTTS pydub")
+        sys.exit(1)
 
-    print("=" * 52)
-    print("  TTS 흐름 테스트" + ("  (--dry-run: 소리 없음)" if dry_run else ""))
-    print("=" * 52)
+    tmp = tempfile.mkdtemp()
+    combined = AudioSegment.silent(duration=0)
 
-    for i, (gap, chunks, text, wait_button) in enumerate(SCENARIO, start=1):
-        if wait_button:
-            input("\n[버튼] Enter 를 누르면 버튼을 누른 것으로 처리합니다... ")
-        elif gap > 0:
-            time.sleep(gap)
-        print(f"[{i}] {text}")
-        speak_and_wait(speaker, chunks, text)
+    for i, (gap, text) in enumerate(FLOW, start=1):
+        if gap > 0:
+            combined += AudioSegment.silent(duration=int(gap * 1000))
+        print(f"[{i}/{len(FLOW)}] (앞 무음 {gap:.0f}초) {text}")
+        line_mp3 = os.path.join(tmp, f"line{i}.mp3")
+        try:
+            gTTS(text, lang="ko").save(line_mp3)   # 문장 전체를 자연스럽게 생성
+        except Exception as e:
+            print(f"[오류] gTTS 생성 실패(인터넷 확인): {e}")
+            sys.exit(1)
+        combined += AudioSegment.from_mp3(line_mp3)
 
-    print("\n[완료] 흐름 재생 끝.")
+    combined.export(OUT_FILE, format="mp3", bitrate=BITRATE)
+    secs = len(combined) / 1000.0
+    print(f"\n[완료] {OUT_FILE} 저장 (총 길이 {secs:.1f}초, {BITRATE})")
 
 
 if __name__ == "__main__":
