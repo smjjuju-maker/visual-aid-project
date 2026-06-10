@@ -90,7 +90,7 @@ NARROW_FRONT_MARGIN_M = 0.4
 #       → 오경보가 많아 ENABLE_STEP_UP을 기본 False로 둔다(실험으로 임계 잡은 뒤 켤 것).
 #
 #   [튜닝 포인트] 아래 상수들을 실제 환경(바닥 재질/조명/카메라 높이)에서 조정.
-ENABLE_STEP_UP = False           # 올라가는 계단 감지(실험용). 가슴정면에선 오경보 많아 기본 OFF.
+ENABLE_STEP_UP = True          # 올라가는 계단 감지(실험용). 가슴정면에선 오경보 많아 기본 OFF.
 DROPOFF_ROI_Y_START = 0.80       # 바닥 ROI: 화면 세로 이 비율부터 (장애물 band 0.2~0.8과 안 겹침)
 DROPOFF_ROI_Y_END   = 0.98       # 맨 끝 2%는 렌즈 왜곡/노이즈라 제외
 DROPOFF_ROI_X_LO    = 0.34       # 바닥 ROI 가로 시작(중앙 1/3 = 정면 발 앞)
