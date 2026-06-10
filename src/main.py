@@ -64,8 +64,8 @@ STOP_REPEAT_INTERVAL = 1.0    # stop 두 번 발화 사이 최소 간격(초)
 #     · stop: 위급하므로 비교적 짧게(자주 갱신 허용)
 #     · warn: 여유 있으므로 길게(불필요한 반복 억제)
 #   상태 키가 '바뀌면'(등급/라벨/방향/회피) 쿨다운과 무관하게 즉시 안내한다.
-STOP_SPEAK_COOLDOWN = 1.5     # 같은 정지 상황 반복 안내 최소 간격(초)
-WARN_SPEAK_COOLDOWN = 3.0     # 같은 주의 상황 반복 안내 최소 간격(초)
+STOP_SPEAK_COOLDOWN = 5.0     # 같은 정지 상황 반복 안내 최소 간격(초)
+WARN_SPEAK_COOLDOWN = 10.0     # 같은 주의 상황 반복 안내 최소 간격(초)
 
 # 점자블록 "곧 벗어남" 판정: 노란 영역의 먼 끝이 이 걸음수 이내면 발화
 TACTILE_LEAVING_STEPS = 4
