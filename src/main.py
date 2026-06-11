@@ -92,7 +92,7 @@ NARROW_CONFIRM_FRAMES = 3
 #   · 연속 N프레임 같은 상태일 때만 확정(노이즈로 인한 헛경고 방지).
 #   · 위험 상태(down/up)로 새로 진입하면 즉시 1회 안내.
 #   · 같은 위험 상태가 계속되면 쿨다운 간격마다 한 번씩 환기(낙상 위험이라 반복 알림).
-ENABLE_DROPOFF = True         # 단차 기능 ON/OFF 스위치. False면 단차 감지·안내 전체 비활성
+ENABLE_DROPOFF = False         # 단차 기능 ON/OFF 스위치. False면 단차 감지·안내 전체 비활성
 DROPOFF_CONFIRM_FRAMES = 3
 DROPOFF_SPEAK_COOLDOWN = 2.0
 
